@@ -29,7 +29,9 @@ from ui import (
     render_roi_counts, render_alerts, render_rain_panel,
     render_polygon_editor_html,
 )
-from utils import resize_frame, get_timestamp, MYT
+from utils import resize_frame, get_timestamp
+from datetime import timezone, timedelta
+MYT = timezone(timedelta(hours=8))
 from weather import WeatherService, render_weather_sidebar, rain_intensity_to_category
 from config import WEATHER_LOCATIONS
 from telegram_notify import TelegramNotifier
