@@ -1,6 +1,18 @@
 @echo off
-title FLOW System V3.0
+title FLOW V3.0 System
 cd /d "%~dp0"
-echo Starting FLOW System...
+
+:loop
+cls
+echo =======================================
+echo   FLOW System V3.0 - Starting...
+echo   Press Ctrl+C to stop or restart
+echo =======================================
+echo.
 streamlit run main.py
-pause
+
+echo.
+echo FLOW System stopped.
+echo Press any key to restart, or close this window to exit.
+pause >nul
+goto loop

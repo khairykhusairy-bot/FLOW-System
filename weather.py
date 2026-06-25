@@ -1,16 +1,26 @@
 """
 FLOW — Flood Level Observation Warning System
-Weather Module: Real-time weather data via Google Maps Platform Weather API
+Weather Module: Dual-provider real-time weather
+
+Providers:
+  • Google Weather API  — true hourly (1-hour intervals)
+  • OpenWeatherMap      — 3-hour intervals, wider forecast cards
 
 Usage:
     from weather import WeatherService
-    ws = WeatherService(latitude=6.1248, longitude=100.3673, location_name="Kangar, Perlis")
-    data = ws.get_current()      # dict with all live metrics
-    forecast = ws.get_forecast() # list of next 24 h hourly entries (true hourly from Google)
+    ws = WeatherService(provider="google")          # or "openweathermap"
+    data = ws.get_current()
+    forecast = ws.get_forecast()
 
-Google Maps Platform Weather API endpoints used:
-    Current : https://weather.googleapis.com/v1/currentConditions:lookup
-    Forecast: https://weather.googleapis.com/v1/forecast/hours:lookup
+Fixes applied (2025-06-20):
+  Fix 1 – Cause 2: OWM forecast rain_mm now divided by 3 to convert from
+           mm/3-hour bucket → mm/hour, matching the live current reading.
+  Fix 2 – Cause 3: OWM forecast is_day now uses real sunrise/sunset timestamps
+           from the /forecast city block instead of a hardcoded 06-20 heuristic.
+  Fix 3 – Cause 4: _fetch() wraps _parse_current and _parse_forecast in
+           separate try/except so a partial failure never corrupts both caches.
+  Fix 4 – Cause 3 (Google): Google forecast is_day also upgraded from heuristic
+           to isDaytime field where available in each hourly slot.
 """
 
 import urllib.request
@@ -18,9 +28,9 @@ import urllib.parse
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from config import WEATHER_LOCATIONS, GOOGLE_WEATHER_API_KEY
+from config import WEATHER_LOCATIONS, GOOGLE_WEATHER_API_KEY, OWM_API_KEY, WEATHER_PROVIDER, TIMEZONE_OFFSET_HOURS
 
 try:
     import folium
@@ -31,19 +41,16 @@ except ImportError:
 
 
 # ─── Custom Location Persistence ──────────────────────────────────────────────
-# Saved alongside config.py so they survive app restarts.
 _CUSTOM_LOC_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "flow_custom_locations.json"
 )
 
 
 def _load_custom_locations() -> Dict[str, tuple]:
-    """Return saved custom locations as {name: (lat, lon)}."""
     try:
         if os.path.exists(_CUSTOM_LOC_FILE):
             with open(_CUSTOM_LOC_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            # Stored as list-of-2 for JSON; convert back to tuple
             return {k: tuple(v) for k, v in raw.items() if len(v) == 2}
     except Exception:
         pass
@@ -51,24 +58,20 @@ def _load_custom_locations() -> Dict[str, tuple]:
 
 
 def _save_custom_locations(locs: Dict[str, tuple]) -> None:
-    """Persist custom locations dict to disk."""
     try:
         with open(_CUSTOM_LOC_FILE, "w", encoding="utf-8") as f:
-            # Store tuples as lists (JSON-safe)
             json.dump({k: list(v) for k, v in locs.items()}, f, indent=2)
     except Exception as exc:
         print(f"[FLOW Weather] Could not save custom locations: {exc}")
 
 
 def _delete_custom_location(name: str) -> None:
-    """Remove a single entry from the persisted custom locations."""
     locs = _load_custom_locations()
     locs.pop(name, None)
     _save_custom_locations(locs)
 
 
 def _reverse_geocode(lat: float, lon: float) -> str:
-    """Return a human-readable name for coordinates using Nominatim (OSM, no key required)."""
     try:
         url = (
             "https://nominatim.openstreetmap.org/reverse"
@@ -91,42 +94,30 @@ def _reverse_geocode(lat: float, lon: float) -> str:
 
 
 # ─── Google Weather condition type → FLOW label + icon ───────────────────────
-# Google returns a string "type" field (e.g. "CLEAR", "RAIN", "THUNDERSTORM").
-# We map these to the same label/icon vocabulary the rest of FLOW already uses.
-
 _GOOGLE_CONDITION_MAP: Dict[str, Dict] = {
-    # Clear / sunny
     "CLEAR":                              {"label": "Clear Sky",              "day": "☀️",  "night": "🌙"},
     "MOSTLY_CLEAR":                       {"label": "Mainly Clear",           "day": "🌤️", "night": "🌙"},
-    # Cloudy
     "PARTLY_CLOUDY":                      {"label": "Partly Cloudy",          "day": "⛅",  "night": "🌤️"},
     "MOSTLY_CLOUDY":                      {"label": "Mostly Cloudy",          "day": "☁️",  "night": "☁️"},
     "CLOUDY":                             {"label": "Overcast",               "day": "☁️",  "night": "☁️"},
-    # Fog / haze
     "FOG":                                {"label": "Fog",                    "day": "🌫️", "night": "🌫️"},
     "LIGHT_FOG":                          {"label": "Light Fog",              "day": "🌫️", "night": "🌫️"},
-    # Drizzle
     "DRIZZLE":                            {"label": "Light Drizzle",          "day": "🌦️", "night": "🌦️"},
     "LIGHT_RAIN_AND_WIND":                {"label": "Light Rain",             "day": "🌧️", "night": "🌧️"},
-    # Rain
     "RAIN":                               {"label": "Slight Rain",            "day": "🌧️", "night": "🌧️"},
     "LIGHT_RAIN":                         {"label": "Slight Rain",            "day": "🌧️", "night": "🌧️"},
     "MODERATE_RAIN":                      {"label": "Moderate Rain",          "day": "🌧️", "night": "🌧️"},
     "HEAVY_RAIN":                         {"label": "Heavy Rain",             "day": "🌧️", "night": "🌧️"},
     "RAIN_AND_WIND":                      {"label": "Heavy Rain",             "day": "🌧️", "night": "🌧️"},
     "HEAVY_RAIN_AND_WIND":                {"label": "Heavy Rain",             "day": "🌧️", "night": "🌧️"},
-    # Showers
     "SHOWERS":                            {"label": "Slight Rain",            "day": "🌦️", "night": "🌦️"},
     "HEAVY_SHOWERS":                      {"label": "Heavy Rain",             "day": "🌧️", "night": "🌧️"},
-    # Freezing
     "FREEZING_DRIZZLE_FREEZING_RAIN":     {"label": "Freezing Rain",          "day": "🌨️", "night": "🌨️"},
-    # Snow
     "SNOW":                               {"label": "Moderate Snow",          "day": "❄️",  "night": "❄️"},
     "LIGHT_SNOW":                         {"label": "Slight Snow",            "day": "🌨️", "night": "🌨️"},
     "HEAVY_SNOW":                         {"label": "Heavy Snow",             "day": "❄️",  "night": "❄️"},
     "SNOW_AND_WIND":                      {"label": "Heavy Snow",             "day": "❄️",  "night": "❄️"},
     "BLIZZARD":                           {"label": "Blizzard",               "day": "❄️",  "night": "❄️"},
-    # Thunder — all variants mapped to ⛈️
     "THUNDERSTORM":                       {"label": "Thunderstorm",           "day": "⛈️", "night": "⛈️"},
     "THUNDERSTORM_AND_RAIN":              {"label": "Thunderstorm",           "day": "⛈️", "night": "⛈️"},
     "HEAVY_THUNDERSTORM_AND_RAIN":        {"label": "Heavy Thunderstorm",     "day": "⛈️", "night": "⛈️"},
@@ -141,19 +132,10 @@ _GOOGLE_CONDITION_MAP: Dict[str, Dict] = {
 
 
 def _smart_condition_fallback(condition_type: str, is_day: bool) -> Dict:
-    """
-    Derive a sensible icon from an unmapped condition type string by scanning
-    for known keywords in order of priority (most specific first).
-    Returns a dict with 'label' and 'icon'.
-    """
     t = condition_type.upper()
-
-    # Thunder takes priority over everything else
     if "THUNDER" in t or "LIGHTNING" in t or "STORM" in t:
-        icon = "⛈️"
-        label = condition_type.replace("_", " ").title()
-        return {"label": label, "icon": icon}
-    if "BLIZZARD" in t or "SNOW" in t or "SLEET" in t or "HAIL" in t or "ICE" in t or "FREEZE" in t or "FREEZ" in t:
+        return {"label": condition_type.replace("_", " ").title(), "icon": "⛈️"}
+    if "BLIZZARD" in t or "SNOW" in t or "SLEET" in t or "HAIL" in t or "ICE" in t or "FREEZ" in t:
         return {"label": condition_type.replace("_", " ").title(), "icon": "❄️"}
     if "SHOWER" in t or "HEAVY_RAIN" in t or "DOWNPOUR" in t:
         return {"label": condition_type.replace("_", " ").title(), "icon": "🌧️"}
@@ -166,310 +148,415 @@ def _smart_condition_fallback(condition_type: str, is_day: bool) -> Dict:
     if "WIND" in t or "GUST" in t or "BREEZY" in t or "SQUALL" in t or "TORNADO" in t or "HURRICANE" in t:
         return {"label": condition_type.replace("_", " ").title(), "icon": "💨"}
     if "CLEAR" in t or "SUNNY" in t or "FAIR" in t:
-        day_icon = "☀️" if is_day else "🌙"
-        return {"label": condition_type.replace("_", " ").title(), "icon": day_icon}
-    # Generic cloudy fallback if nothing matched
+        return {"label": condition_type.replace("_", " ").title(), "icon": "☀️" if is_day else "🌙"}
     return {"label": condition_type.replace("_", " ").title(), "icon": "🌤️" if is_day else "🌙"}
 
 
 def _google_condition(condition_type: str, is_day: bool) -> Dict:
-    """Map a Google Weather condition type string to a label + icon dict."""
     entry = _GOOGLE_CONDITION_MAP.get(condition_type.upper())
     if entry:
         return {"label": entry["label"], "icon": entry["day"] if is_day else entry["night"]}
-    # Smart keyword-based fallback — never returns the thermometer 🌡️
     return _smart_condition_fallback(condition_type, is_day)
 
 
 def rain_intensity_to_category(intensity: float) -> str:
-    """
-    Map a normalised rain intensity (0-1) to a human-readable category name
-    that matches the WMO-style labels used by the live weather sidebar.
-
-    0.00              → "No Rain"
-    0.001 – 0.199     → "Light Drizzle"
-    0.200 – 0.399     → "Slight Rain"
-    0.400 – 0.599     → "Moderate Rain"
-    0.600 – 0.799     → "Heavy Rain"
-    0.800 – 1.000     → "Violent Showers"
-    """
-    if intensity <= 0.0:
-        return "No Rain"
-    elif intensity < 0.2:
-        return "Light Drizzle"
-    elif intensity < 0.4:
-        return "Slight Rain"
-    elif intensity < 0.6:
-        return "Moderate Rain"
-    elif intensity < 0.8:
-        return "Heavy Rain"
-    else:
-        return "Violent Showers"
+    if intensity <= 0.0:   return "No Rain"
+    elif intensity < 0.2:  return "Light Drizzle"
+    elif intensity < 0.4:  return "Slight Rain"
+    elif intensity < 0.6:  return "Moderate Rain"
+    elif intensity < 0.8:  return "Heavy Rain"
+    else:                  return "Violent Showers"
 
 
 def _rain_to_intensity(mm_per_hour: float) -> float:
-    """
-    Convert rainfall (mm/h) to a 0-1 normalised intensity value
-    compatible with FLOW's FloodPredictor and AlertManager.
-
-    Scale (typical tropical reference):
-        0       mm/h  → 0.00  (dry)
-        2.5     mm/h  → 0.25  (light rain)
-        7.5     mm/h  → 0.50  (moderate)
-        15      mm/h  → 0.75  (heavy)
-        25+     mm/h  → 1.00  (extreme / flash-flood territory)
-    """
     return round(min(1.0, mm_per_hour / 25.0), 4)
 
 
-class WeatherService:
-    """
-    Fetches current conditions and hourly forecast from the Google Maps Platform
-    Weather API.  Results are cached for `cache_ttl` seconds to avoid hammering
-    the API on every Streamlit rerender.
+# ─── OpenWeatherMap backend ────────────────────────────────────────────────────
+class _OWMBackend:
+    """Fetches weather from OpenWeatherMap (3-hour forecast intervals)."""
 
-    Google Weather API endpoints used:
-        Current  : https://weather.googleapis.com/v1/currentConditions:lookup
-        Forecast : https://weather.googleapis.com/v1/forecast/hours:lookup
+    CURRENT_URL  = "https://api.openweathermap.org/data/2.5/weather"
+    FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 
-    The public interface (get_current, get_forecast, rain_intensity,
-    update_location, force_refresh, last_error, is_stale) is identical to the
-    previous OpenWeatherMap implementation so the rest of FLOW needs no changes.
+    _OWM_ICON_MAP = {
+        200: ("Thunderstorm w/ Rain",  "⛈️"), 201: ("Thunderstorm w/ Rain",  "⛈️"),
+        202: ("Heavy Thunderstorm",    "⛈️"), 210: ("Light Thunderstorm",    "⛈️"),
+        211: ("Thunderstorm",          "⛈️"), 212: ("Heavy Thunderstorm",    "⛈️"),
+        221: ("Ragged Thunderstorm",   "⛈️"), 230: ("Thunderstorm Drizzle",  "⛈️"),
+        231: ("Thunderstorm Drizzle",  "⛈️"), 232: ("Heavy T-Storm Drizzle", "⛈️"),
+        300: ("Light Drizzle",         "🌦️"), 301: ("Drizzle",               "🌦️"),
+        302: ("Heavy Drizzle",         "🌧️"), 310: ("Light Drizzle Rain",    "🌧️"),
+        311: ("Drizzle Rain",          "🌧️"), 312: ("Heavy Drizzle Rain",    "🌧️"),
+        313: ("Shower Drizzle",        "🌧️"), 314: ("Heavy Shower Drizzle",  "🌧️"),
+        321: ("Shower Drizzle",        "🌧️"), 500: ("Slight Rain",           "🌧️"),
+        501: ("Moderate Rain",         "🌧️"), 502: ("Heavy Rain",            "🌧️"),
+        503: ("Very Heavy Rain",       "🌧️"), 504: ("Extreme Rain",          "🌧️"),
+        511: ("Freezing Rain",         "🌨️"), 520: ("Light Showers",         "🌦️"),
+        521: ("Rain Showers",          "🌧️"), 522: ("Heavy Showers",         "🌧️"),
+        531: ("Ragged Showers",        "🌧️"), 600: ("Slight Snow",           "❄️"),
+        601: ("Moderate Snow",         "❄️"),  602: ("Heavy Snow",            "❄️"),
+        611: ("Sleet",                 "🌨️"), 612: ("Light Sleet",           "🌨️"),
+        613: ("Sleet Showers",         "🌨️"), 615: ("Light Rain & Snow",     "🌨️"),
+        616: ("Rain & Snow",           "🌨️"), 620: ("Light Snow Showers",    "🌨️"),
+        621: ("Snow Showers",          "❄️"),  622: ("Heavy Snow Showers",    "❄️"),
+        701: ("Mist",                  "🌫️"), 711: ("Smoke",                 "🌫️"),
+        721: ("Haze",                  "🌫️"), 731: ("Dust/Sand",             "🌫️"),
+        741: ("Fog",                   "🌫️"), 751: ("Sand",                  "🌫️"),
+        761: ("Dust",                  "🌫️"), 762: ("Volcanic Ash",          "🌫️"),
+        771: ("Squalls",               "💨"),  781: ("Tornado",               "🌪️"),
+        800: ("Clear Sky",             "☀️"),  801: ("Few Clouds (11-25%)",   "🌤️"),
+        802: ("Scattered Clouds",      "⛅"),  803: ("Broken Clouds",         "☁️"),
+        804: ("Overcast",              "☁️"),
+    }
 
-    Parameters
-    ----------
-    latitude, longitude : Monitoring site coordinates.
-    location_name       : Human-readable name shown in the UI.
-    cache_ttl           : Seconds to cache results (default: 300 = 5 min).
-    api_key             : Google Maps API key (defaults to GOOGLE_WEATHER_API_KEY).
-    """
-
-    CURRENT_URL  = "https://weather.googleapis.com/v1/currentConditions:lookup"
-    FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hours:lookup"
-
-    def __init__(
-        self,
-        latitude: float = 6.1248,
-        longitude: float = 100.3673,
-        location_name: str = "Monitoring Site",
-        cache_ttl: int = 300,
-        api_key: str = GOOGLE_WEATHER_API_KEY,
-    ):
-        self.latitude      = latitude
-        self.longitude     = longitude
-        self.location_name = location_name
-        self.cache_ttl     = cache_ttl
-        self._api_key      = api_key
-
+    def __init__(self, lat, lon, name, api_key, cache_ttl):
+        self.lat = lat; self.lon = lon; self.name = name
+        self.api_key = api_key; self.cache_ttl = cache_ttl
         self._current_cache:  Optional[Dict]       = None
         self._forecast_cache: Optional[List[Dict]] = None
         self._last_fetch:     float                = 0.0
         self._fetch_error:    Optional[str]        = None
 
-    # ─── Public API ───────────────────────────────────────────────────────────
-
-    def get_current(self) -> Dict:
-        """
-        Return current weather conditions as a flat dict:
-            temperature      float   °C
-            feels_like       float   °C
-            humidity         float   %
-            wind_speed       float   km/h
-            wind_direction   int     °
-            rain_mm          float   mm/h  (last-1h value from OWM, treated as mm/h)
-            rain_intensity   float   0-1   (normalised, ready for FloodPredictor)
-            condition_label  str
-            condition_icon   str
-            weather_code     int     (OWM condition ID)
-            is_day           bool
-            timestamp        str     ISO-8601
-            location         str
-            error            str | None
-        """
-        self._maybe_refresh()
-        if self._current_cache:
-            return self._current_cache
-        return self._error_payload()
-
-    def get_forecast(self, hours: int = 24) -> List[Dict]:
-        """
-        Return a list of forecast dicts for approximately the next `hours` hours.
-        Google Weather API returns true hourly data; each dict has:
-            time, temperature, rain_mm, rain_intensity,
-            condition_label, condition_icon, wind_speed, humidity.
-        """
-        self._maybe_refresh()
-        if self._forecast_cache:
-            return self._forecast_cache[:hours]
-        return []
-
-    def rain_intensity(self) -> float:
-        """Shortcut: just the normalised rain intensity (0-1), safe to call often."""
-        return self.get_current().get("rain_intensity", 0.0)
-
-    @property
-    def last_error(self) -> Optional[str]:
-        return self._fetch_error
-
-    @property
-    def is_stale(self) -> bool:
-        return (time.time() - self._last_fetch) > self.cache_ttl * 2
-
-    def force_refresh(self):
-        """Bypass cache and fetch fresh data immediately."""
-        self._last_fetch = 0.0
-        self._maybe_refresh()
-
-    def update_location(self, latitude: float, longitude: float, location_name: str):
-        """
-        Switch to a new monitoring location and immediately invalidate the cache
-        so the next call to get_current() / get_forecast() fetches fresh data.
-        """
-        if (
-            self.latitude      != latitude
-            or self.longitude  != longitude
-            or self.location_name != location_name
-        ):
-            self.latitude      = latitude
-            self.longitude     = longitude
-            self.location_name = location_name
-            self._current_cache  = None
-            self._forecast_cache = None
-            self._last_fetch     = 0.0
-            self._fetch_error    = None
-
-    # ─── Internal ─────────────────────────────────────────────────────────────
-
-    def _maybe_refresh(self):
-        """Fetch from API only when cache has expired."""
+    def maybe_refresh(self):
         if (time.time() - self._last_fetch) < self.cache_ttl:
             return
         try:
-            self._fetch()
-            self._fetch_error = None
+            self._fetch(); self._fetch_error = None
         except Exception as exc:
             self._fetch_error = str(exc)
-            print(f"[FLOW Weather] Fetch failed: {exc}")
+            print(f"[FLOW Weather OWM] Fetch failed: {exc}")
+
+    def _fetch_json(self, url: str) -> Dict:
+        req = urllib.request.Request(url, headers={"User-Agent": "FLOW-FloodMonitor/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+
+    def _owm_condition(self, weather_list: list, is_day: bool):
+        if not weather_list:
+            return "Clear Sky", "☀️" if is_day else "🌙"
+        cid   = weather_list[0].get("id", 800)
+        entry = self._OWM_ICON_MAP.get(cid)
+        if entry:
+            label, icon = entry
+            if not is_day and cid in (800, 801):
+                icon = "🌙"
+            return label, icon
+        return weather_list[0].get("description", "Unknown").title(), "🌤️"
+
+    # ── Fix (Cause 4): separate try/except per parse so a bad forecast payload
+    #    never wipes out a successfully fetched current reading, and vice versa.
+    def _fetch(self):
+        cur_url = (f"{self.CURRENT_URL}?lat={self.lat}&lon={self.lon}"
+                   f"&appid={self.api_key}&units=metric")
+        fc_url  = (f"{self.FORECAST_URL}?lat={self.lat}&lon={self.lon}"
+                   f"&appid={self.api_key}&units=metric&cnt=16")
+
+        cur_raw = self._fetch_json(cur_url)
+        fc_raw  = self._fetch_json(fc_url)
+
+        try:
+            self._parse_current(cur_raw)
+        except Exception as exc:
+            print(f"[FLOW Weather OWM] _parse_current failed: {exc}")
+
+        try:
+            self._parse_forecast(fc_raw)
+        except Exception as exc:
+            print(f"[FLOW Weather OWM] _parse_forecast failed: {exc}")
+
+        self._last_fetch = time.time()
+
+    def _parse_current(self, raw: Dict):
+        ts      = raw.get("dt", time.time())
+        sr      = raw.get("sys", {})
+        # Adjust sunrise/sunset check for local timezone
+        ts_local = ts + TIMEZONE_OFFSET_HOURS * 3600
+        is_day  = sr.get("sunrise", 0) <= ts_local <= sr.get("sunset", ts + 1)
+        wlist   = raw.get("weather", [])
+        label, icon = self._owm_condition(wlist, is_day)
+        main    = raw.get("main", {}); wind = raw.get("wind", {})
+        rain    = raw.get("rain", {})
+        rain_mm = float(rain.get("1h", rain.get("3h", 0)) or 0)
+        # Display timestamp in local timezone
+        dt_local = datetime.utcfromtimestamp(ts_local)
+        self._current_cache = {
+            "temperature":     round(float(main.get("temp",       0)), 1),
+            "feels_like":      round(float(main.get("feels_like", 0)), 1),
+            "humidity":        round(float(main.get("humidity",   0)), 1),
+            "wind_speed":      round(float(wind.get("speed", 0)) * 3.6, 1),
+            "wind_direction":  int(wind.get("deg", 0)),
+            "rain_mm":         round(rain_mm, 2),
+            "rain_intensity":  _rain_to_intensity(rain_mm),
+            "condition_label": label, "condition_icon": icon,
+            "weather_code":    wlist[0].get("id", 0) if wlist else 0,
+            "is_day":          is_day,
+            "timestamp":       dt_local.isoformat(),
+            "location":        self.name, "error": None,
+        }
+
+    def _parse_forecast(self, raw: Dict):
+        entries = []
+
+        # Fix (Cause 3): pull real sunrise/sunset from the /forecast city block
+        # so is_day per slot uses accurate astronomical data, not a 06-20 guess.
+        city     = raw.get("city", {})
+        _sunrise = city.get("sunrise", 0)
+        _sunset  = city.get("sunset",  0)
+
+        for item in raw.get("list", []):
+            ts = item.get("dt", 0)
+            try:
+                dt_obj = datetime.utcfromtimestamp(ts)
+                # Convert UTC time to local timezone
+                dt_local = datetime.utcfromtimestamp(ts + TIMEZONE_OFFSET_HOURS * 3600)
+            except Exception:
+                continue
+
+            # Fix (Cause 3): prefer real sunrise/sunset; fall back to heuristic
+            # Convert sunrise/sunset to local time for proper day/night detection
+            if _sunrise and _sunset:
+                # Adjust sunrise/sunset for local timezone
+                ts_local = ts + TIMEZONE_OFFSET_HOURS * 3600
+                is_day_f = _sunrise <= ts_local <= _sunset
+            else:
+                is_day_f = 6 <= dt_local.hour < 20
+
+            wlist = item.get("weather", [])
+            label, icon = self._owm_condition(wlist, is_day_f)
+            main = item.get("main", {}); wind = item.get("wind", {})
+
+            # Fix (Cause 2): OWM /forecast rain["3h"] is mm per 3-hour bucket.
+            # Divide by 3 → mm/h so forecast rain_mm matches the live current units.
+            rain_3h = float(item.get("rain", {}).get("3h", 0) or 0)
+            rain_mm = round(rain_3h / 3.0, 2)
+
+            entries.append({
+                "time":            dt_local.strftime("%Y-%m-%dT%H:%M"),
+                "temperature":     round(float(main.get("temp",     0)), 1),
+                "humidity":        round(float(main.get("humidity", 0)), 1),
+                "rain_mm":         rain_mm,
+                "rain_intensity":  _rain_to_intensity(rain_mm),
+                "condition_label": label, "condition_icon": icon,
+                "wind_speed":      round(float(wind.get("speed", 0)) * 3.6, 1),
+                "interval_hours":  3,
+            })
+        self._forecast_cache = entries
+
+
+# ─── Google Weather backend ────────────────────────────────────────────────────
+class _GoogleBackend:
+    """Fetches weather from Google Maps Platform Weather API (true hourly)."""
+
+    CURRENT_URL  = "https://weather.googleapis.com/v1/currentConditions:lookup"
+    FORECAST_URL = "https://weather.googleapis.com/v1/forecast/hours:lookup"
+
+    def __init__(self, lat, lon, name, api_key, cache_ttl):
+        self.lat = lat; self.lon = lon; self.name = name
+        self.api_key = api_key; self.cache_ttl = cache_ttl
+        self._current_cache:  Optional[Dict]       = None
+        self._forecast_cache: Optional[List[Dict]] = None
+        self._last_fetch:     float                = 0.0
+        self._fetch_error:    Optional[str]        = None
+
+    def maybe_refresh(self):
+        if (time.time() - self._last_fetch) < self.cache_ttl:
+            return
+        try:
+            self._fetch(); self._fetch_error = None
+        except Exception as exc:
+            self._fetch_error = str(exc)
+            print(f"[FLOW Weather Google] Fetch failed: {exc}")
 
     def _build_url(self, base: str, extra: dict = None) -> str:
-        """Build a Google Weather API URL with location and key parameters."""
-        params = {
-            "location.latitude":  self.latitude,
-            "location.longitude": self.longitude,
-            "key":                self._api_key,
-            "unitsSystem":        "METRIC",
-            "languageCode":       "en",
-        }
+        params = {"location.latitude": self.lat, "location.longitude": self.lon,
+                  "key": self.api_key, "unitsSystem": "METRIC", "languageCode": "en"}
         if extra:
             params.update(extra)
         return f"{base}?{urllib.parse.urlencode(params)}"
 
     def _fetch_json(self, url: str) -> Dict:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "FLOW-FloodMonitor/1.0"}
-        )
+        req = urllib.request.Request(url, headers={"User-Agent": "FLOW-FloodMonitor/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
 
+    # ── Fix (Cause 4): separate try/except per parse (mirrors OWM backend fix)
     def _fetch(self):
-        """Fetch current + forecast from Google Weather API and populate both caches."""
-        current_url  = self._build_url(self.CURRENT_URL)
-        forecast_url = self._build_url(self.FORECAST_URL, {"hours": 24})  # true hourly, 24 h
+        cur_raw = self._fetch_json(self._build_url(self.CURRENT_URL))
+        fc_raw  = self._fetch_json(self._build_url(self.FORECAST_URL, {"hours": 24}))
 
-        current_raw  = self._fetch_json(current_url)
-        forecast_raw = self._fetch_json(forecast_url)
+        try:
+            self._parse_current(cur_raw)
+        except Exception as exc:
+            print(f"[FLOW Weather Google] _parse_current failed: {exc}")
 
-        self._parse_current(current_raw)
-        self._parse_forecast(forecast_raw)
+        try:
+            self._parse_forecast(fc_raw)
+        except Exception as exc:
+            print(f"[FLOW Weather Google] _parse_forecast failed: {exc}")
+
         self._last_fetch = time.time()
 
     def _parse_current(self, raw: Dict):
-        """Parse Google Weather API /currentConditions:lookup response."""
-        is_day = bool(raw.get("isDaytime", True))
-
-        # Condition
-        weather_cond = raw.get("weatherCondition", {})
-        cond_type    = weather_cond.get("type", "CLEAR")
-        cond         = _google_condition(cond_type, is_day)
-
-        # Temperature (Google returns nested {degrees, unit})
-        temp_obj       = raw.get("temperature",        {"degrees": 0})
-        feels_obj      = raw.get("feelsLikeTemperature", {"degrees": 0})
-        humidity       = float(raw.get("relativeHumidity", 0) or 0)
-
-        # Wind (Google: windSpeed in km/h when unitsSystem=METRIC)
+        is_day    = bool(raw.get("isDaytime", True))
+        cond      = _google_condition(raw.get("weatherCondition", {}).get("type", "CLEAR"), is_day)
+        temp_obj  = raw.get("temperature",         {"degrees": 0})
+        feels_obj = raw.get("feelsLikeTemperature", {"degrees": 0})
         wind_obj  = raw.get("wind", {})
-        wind_kmh  = round(float(wind_obj.get("speed", {}).get("value", 0) or 0), 1)
-        wind_deg  = int(wind_obj.get("direction", {}).get("degrees", 0) or 0)
-
-        # Precipitation (Google: precipitation.qpf.quantity = mm accumulated over past hour)
-        precip    = raw.get("precipitation", {})
-        qpf_obj   = precip.get("qpf", {"quantity": 0})
-        rain_mm   = float(qpf_obj.get("quantity", 0) or 0)
-
-        # Timestamp (ISO-8601 string from Google)
-        ts_raw = raw.get("currentTime", datetime.utcnow().isoformat() + "Z")
+        rain_mm   = float(raw.get("precipitation", {}).get("qpf", {"quantity": 0}).get("quantity", 0) or 0)
+        ts_raw    = raw.get("currentTime", datetime.utcnow().isoformat() + "Z")
         try:
-            ts_iso = datetime.fromisoformat(ts_raw.rstrip("Z")).isoformat()
-        except Exception:
+            dt_utc = datetime.fromisoformat(ts_raw.rstrip("Z"))
+            dt_local = dt_utc + timedelta(hours=TIMEZONE_OFFSET_HOURS)
+            ts_iso = dt_local.isoformat()
+        except:
             ts_iso = datetime.now().isoformat()
-
         self._current_cache = {
             "temperature":     round(float(temp_obj.get("degrees",  0)), 1),
             "feels_like":      round(float(feels_obj.get("degrees", 0)), 1),
-            "humidity":        round(humidity, 1),
-            "wind_speed":      wind_kmh,
-            "wind_direction":  wind_deg,
+            "humidity":        round(float(raw.get("relativeHumidity", 0) or 0), 1),
+            "wind_speed":      round(float(wind_obj.get("speed", {}).get("value", 0) or 0), 1),
+            "wind_direction":  int(wind_obj.get("direction", {}).get("degrees", 0) or 0),
             "rain_mm":         round(rain_mm, 2),
             "rain_intensity":  _rain_to_intensity(rain_mm),
-            "condition_label": cond["label"],
-            "condition_icon":  cond["icon"],
-            "weather_code":    0,          # Google doesn't use numeric codes; kept for compat
-            "is_day":          is_day,
-            "timestamp":       ts_iso,
-            "location":        self.location_name,
-            "error":           None,
+            "condition_label": cond["label"], "condition_icon": cond["icon"],
+            "weather_code":    0, "is_day": is_day, "timestamp": ts_iso,
+            "location":        self.name, "error": None,
         }
 
     def _parse_forecast(self, raw: Dict):
-        """Parse Google Weather API /forecast/hours:lookup response (true hourly)."""
         entries = []
-
         for item in raw.get("forecastHours", []):
-            # Google timestamp is an ISO-8601 string
             ts_raw = item.get("interval", {}).get("startTime", "")
             try:
                 dt_obj = datetime.fromisoformat(ts_raw.rstrip("Z"))
-            except Exception:
+                # Convert to local timezone using timedelta for proper date wrapping
+                dt_local = dt_obj + timedelta(hours=TIMEZONE_OFFSET_HOURS)
+            except:
                 continue
 
-            is_day_f = 6 <= dt_obj.hour < 20
-            weather_cond = item.get("weatherCondition", {})
-            cond_type    = weather_cond.get("type", "CLEAR")
-            cond         = _google_condition(cond_type, is_day_f)
+            # Fix (Cause 3 / Google): use isDaytime field per slot when present;
+            # fall back to hour heuristic only if the field is absent.
+            if "isDaytime" in item:
+                is_day_f = bool(item["isDaytime"])
+            else:
+                is_day_f = 6 <= dt_local.hour < 20
 
-            temp_obj  = item.get("temperature",     {"degrees": 0})
-            hum       = float(item.get("relativeHumidity", 0) or 0)
-            wind_obj  = item.get("wind", {})
-            wind_kmh  = round(float(wind_obj.get("speed", {}).get("value", 0) or 0), 1)
-
-            precip    = item.get("precipitation", {})
-            qpf_obj   = precip.get("qpf", {"quantity": 0})
-            rain_mm   = float(qpf_obj.get("quantity", 0) or 0)
-
+            cond     = _google_condition(item.get("weatherCondition", {}).get("type", "CLEAR"), is_day_f)
+            wind_obj = item.get("wind", {})
+            rain_mm  = float(item.get("precipitation", {}).get("qpf", {"quantity": 0}).get("quantity", 0) or 0)
             entries.append({
-                "time":            dt_obj.strftime("%Y-%m-%dT%H:%M"),
-                "temperature":     round(float(temp_obj.get("degrees", 0)), 1),
-                "humidity":        round(hum, 1),
+                "time":            dt_local.strftime("%Y-%m-%dT%H:%M"),
+                "temperature":     round(float(item.get("temperature", {"degrees": 0}).get("degrees", 0)), 1),
+                "humidity":        round(float(item.get("relativeHumidity", 0) or 0), 1),
                 "rain_mm":         round(rain_mm, 2),
                 "rain_intensity":  _rain_to_intensity(rain_mm),
-                "condition_label": cond["label"],
-                "condition_icon":  cond["icon"],
-                "wind_speed":      wind_kmh,
+                "condition_label": cond["label"], "condition_icon": cond["icon"],
+                "wind_speed":      round(float(wind_obj.get("speed", {}).get("value", 0) or 0), 1),
+                "interval_hours":  1,
             })
-
         self._forecast_cache = entries
+
+
+# ─── WeatherService facade ─────────────────────────────────────────────────────
+class WeatherService:
+    """
+    Provider-agnostic weather facade for FLOW.
+    Supports:
+      • provider="google"         – Google Maps Platform Weather API (true hourly)
+      • provider="openweathermap" – OpenWeatherMap API (3-hour intervals)
+    """
+
+    PROVIDERS = {
+        "google":         ("Google Weather",   "🌐 Google Weather"),
+        "openweathermap": ("OpenWeatherMap",   "🌦️ OpenWeatherMap"),
+    }
+
+    def __init__(
+        self,
+        latitude:      float = 6.1248,
+        longitude:     float = 100.3673,
+        location_name: str   = "Monitoring Site",
+        cache_ttl:     int   = 300,
+        provider:      str   = WEATHER_PROVIDER,
+        api_key:       str   = None,   # deprecated; kept for compat
+    ):
+        self.latitude      = latitude
+        self.longitude     = longitude
+        self.location_name = location_name
+        self.cache_ttl     = cache_ttl
+        self._provider     = provider.lower().strip()
+        self._backend      = self._make_backend()
+
+    # ─── Backend factory ──────────────────────────────────────────────────────
+    def _make_backend(self):
+        if self._provider == "openweathermap":
+            return _OWMBackend(self.latitude, self.longitude, self.location_name,
+                               OWM_API_KEY, self.cache_ttl)
+        return _GoogleBackend(self.latitude, self.longitude, self.location_name,
+                              GOOGLE_WEATHER_API_KEY, self.cache_ttl)
+
+    # ─── Provider switching ───────────────────────────────────────────────────
+    def set_provider(self, provider: str):
+        """Switch provider at runtime; invalidates cache."""
+        p = provider.lower().strip()
+        if p not in self.PROVIDERS:
+            raise ValueError(f"Unknown provider '{provider}'. Valid: {list(self.PROVIDERS)}.")
+        if p != self._provider:
+            self._provider = p
+            self._backend  = self._make_backend()
+
+    @property
+    def provider(self) -> str:
+        return self._provider
+
+    @property
+    def provider_label(self) -> str:
+        return self.PROVIDERS.get(self._provider, (self._provider,))[0]
+
+    # ─── Public API ───────────────────────────────────────────────────────────
+    def get_current(self) -> Dict:
+        """Return current weather as a flat dict (provider-independent)."""
+        self._backend.maybe_refresh()
+        if self._backend._current_cache:
+            return self._backend._current_cache
+        return self._error_payload()
+
+    def get_forecast(self, hours: int = 24) -> List[Dict]:
+        """
+        Return forecast entries for approximately the next `hours` hours.
+        Google: true hourly (1-h slots).
+        OWM:    3-hour slots — cards are wider in the sidebar UI.
+        """
+        self._backend.maybe_refresh()
+        if self._backend._forecast_cache:
+            if self._provider == "openweathermap":
+                return self._backend._forecast_cache[:max(1, (hours + 2) // 3)]
+            return self._backend._forecast_cache[:hours]
+        return []
+
+    def rain_intensity(self) -> float:
+        return self.get_current().get("rain_intensity", 0.0)
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._backend._fetch_error
+
+    @property
+    def is_stale(self) -> bool:
+        return (time.time() - self._backend._last_fetch) > self.cache_ttl * 2
+
+    def force_refresh(self):
+        self._backend._last_fetch = 0.0
+        self._backend.maybe_refresh()
+
+    def update_location(self, latitude: float, longitude: float, location_name: str):
+        changed = (self.latitude != latitude or self.longitude != longitude
+                   or self.location_name != location_name)
+        self.latitude = latitude; self.longitude = longitude
+        self.location_name = location_name
+        if changed:
+            self._backend = self._make_backend()
 
     @staticmethod
     def _error_payload() -> Dict:
@@ -495,48 +582,55 @@ def render_weather_sidebar(ws: WeatherService):
 
     st.markdown('<div class="sidebar-label">🌤️ LIVE WEATHER</div>', unsafe_allow_html=True)
 
-    # ── Build merged location list ─────────────────────────────────────────────
-    # Order: "📍 Custom Location" first, then user-saved customs, then presets.
-    custom_locs  = _load_custom_locations()           # {name: (lat, lon)}
-    preset_locs  = {k: v for k, v in WEATHER_LOCATIONS.items() if k != "📍 Custom Location"}
+    # ── Weather API Provider selector ─────────────────────────────────────────
+    _provider_options = {
+        "🌐 Google Weather":  "google",
+        "🌦️ OpenWeatherMap": "openweathermap",
+    }
+    _prov_labels = list(_provider_options.keys())
+    _cur_label   = next((lbl for lbl, key in _provider_options.items() if key == ws.provider),
+                        _prov_labels[0])
+    _sel_label   = st.selectbox(
+        "🔌 Weather API",
+        _prov_labels,
+        index=_prov_labels.index(_cur_label),
+        key="weather_provider_select",
+        help="Google Weather: true hourly data. OpenWeatherMap: 3-hour interval forecast.",
+    )
+    _chosen_prov = _provider_options[_sel_label]
+    if _chosen_prov != ws.provider:
+        ws.set_provider(_chosen_prov)
+        st.rerun()
 
-    # Full ordered dict for the selectbox
+    # ── Build merged location list ─────────────────────────────────────────────
+    custom_locs  = _load_custom_locations()
+    preset_locs  = {k: v for k, v in WEATHER_LOCATIONS.items() if k != "📍 Custom Location"}
     all_locations: Dict[str, tuple] = {"📍 Custom Location": None}
     all_locations.update(custom_locs)
     all_locations.update(preset_locs)
-
     location_names = list(all_locations.keys())
 
-    # Work out which index to pre-select
     current_name = ws.location_name
     default_idx  = 0
     for i, name in enumerate(location_names):
         if name == current_name:
-            default_idx = i
-            break
+            default_idx = i; break
 
-    # ── Location selectbox + delete button for saved custom entries ────────────
-    # Show a delete (✕) button next to the selectbox only when the active
-    # selection is a user-saved custom location (not a built-in preset).
-    selected_is_custom_saved = (
-        current_name in custom_locs and current_name in location_names
-    )
+    selected_is_custom_saved = (current_name in custom_locs and current_name in location_names)
 
     if selected_is_custom_saved:
         sel_col, del_col = st.columns([5, 1])
         with sel_col:
             chosen_name = st.selectbox(
-                "📌 Location",
-                location_names,
-                index=default_idx,
+                "📌 Location", location_names, index=default_idx,
                 key="weather_location_select",
                 help="Choose a preset, a saved custom location, or '📍 Custom Location' to add a new one.",
             )
         with del_col:
             st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
-            if st.button("✕", key="weather_delete_btn", help=f"Remove '{current_name}' from saved locations"):
+            if st.button("✕", key="weather_delete_btn",
+                         help=f"Remove '{current_name}' from saved locations"):
                 _delete_custom_location(current_name)
-                # Fall back to first preset after deletion
                 first_preset = next(iter(preset_locs), None)
                 if first_preset:
                     lat, lon = preset_locs[first_preset]
@@ -544,9 +638,7 @@ def render_weather_sidebar(ws: WeatherService):
                 st.rerun()
     else:
         chosen_name = st.selectbox(
-            "📌 Location",
-            location_names,
-            index=default_idx,
+            "📌 Location", location_names, index=default_idx,
             key="weather_location_select",
             help="Choose a preset, a saved custom location, or '📍 Custom Location' to add a new one.",
         )
@@ -554,7 +646,6 @@ def render_weather_sidebar(ws: WeatherService):
     coords = all_locations[chosen_name]
 
     if coords is None:
-        # ── Map-based location picker ──────────────────────────────────────────
         if "flow_map_lat" not in st.session_state:
             st.session_state.flow_map_lat = ws.latitude
         if "flow_map_lon" not in st.session_state:
@@ -573,12 +664,8 @@ def render_weather_sidebar(ws: WeatherService):
                 tooltip=f"📍 {_mlat:.4f}°, {_mlon:.4f}°",
                 icon=folium.Icon(color="red", icon="info-sign"),
             ).add_to(_m)
-            _map_data = st_folium(
-                _m,
-                key="flow_location_map",
-                height=310,
-                returned_objects=["last_clicked"],
-            )
+            _map_data = st_folium(_m, key="flow_location_map", height=310,
+                                  returned_objects=["last_clicked"])
             if _map_data and _map_data.get("last_clicked"):
                 _click = _map_data["last_clicked"]
                 _new_lat = round(float(_click["lat"]), 6)
@@ -592,34 +679,24 @@ def render_weather_sidebar(ws: WeatherService):
             st.info("Install `folium` & `streamlit-folium` to enable map selection.")
             _c1, _c2 = st.columns(2)
             with _c1:
-                _new_lat = st.number_input(
-                    "Latitude", value=_mlat,
-                    min_value=-90.0, max_value=90.0,
-                    format="%.6f", key="weather_custom_lat",
-                )
+                _new_lat = st.number_input("Latitude",  value=_mlat,
+                    min_value=-90.0, max_value=90.0, format="%.6f", key="weather_custom_lat")
             with _c2:
-                _new_lon = st.number_input(
-                    "Longitude", value=_mlon,
-                    min_value=-180.0, max_value=180.0,
-                    format="%.6f", key="weather_custom_lon",
-                )
+                _new_lon = st.number_input("Longitude", value=_mlon,
+                    min_value=-180.0, max_value=180.0, format="%.6f", key="weather_custom_lon")
             if abs(_new_lat - _mlat) > 1e-6 or abs(_new_lon - _mlon) > 1e-6:
                 st.session_state.flow_map_lat = _new_lat
                 st.session_state.flow_map_lon = _new_lon
                 st.session_state.flow_map_geocoded_for = None
                 st.rerun()
 
-        # Reverse-geocode when coordinates change (only runs once per new location)
         _geo_key = (st.session_state.flow_map_lat, st.session_state.flow_map_lon)
         if st.session_state.flow_map_geocoded_for != _geo_key:
-            _geocoded = _reverse_geocode(
-                st.session_state.flow_map_lat,
-                st.session_state.flow_map_lon,
-            )
+            _geocoded = _reverse_geocode(st.session_state.flow_map_lat,
+                                         st.session_state.flow_map_lon)
             st.session_state.flow_map_geocoded_for = _geo_key
             st.session_state["weather_custom_name"] = _geocoded
 
-        # Confirmation panel
         st.markdown(f"""
 <div style="background:rgba(0,180,255,0.07);border:1px solid rgba(0,180,255,0.18);
      border-radius:8px;padding:8px 10px;margin:6px 0 4px;">
@@ -643,37 +720,26 @@ def render_weather_sidebar(ws: WeatherService):
 </div>
 """, unsafe_allow_html=True)
 
-        custom_label = st.text_input(
-            "Location Name",
-            key="weather_custom_name",
-            placeholder="e.g. My River Site",
-        )
+        custom_label = st.text_input("Location Name", key="weather_custom_name",
+                                     placeholder="e.g. My River Site")
 
         _btn_apply, _btn_save = st.columns(2)
         with _btn_apply:
             if st.button("🔄 Apply", use_container_width=True, key="weather_apply_btn",
                          help="Use this location now without saving"):
-                ws.update_location(
-                    st.session_state.flow_map_lat,
-                    st.session_state.flow_map_lon,
-                    custom_label.strip() or "Custom Location",
-                )
+                ws.update_location(st.session_state.flow_map_lat,
+                                   st.session_state.flow_map_lon,
+                                   custom_label.strip() or "Custom Location")
                 st.rerun()
         with _btn_save:
             if st.button("💾 Save", use_container_width=True, key="weather_save_btn",
                          help="Save permanently to the location list"):
                 label = custom_label.strip() or "Custom Location"
                 locs  = _load_custom_locations()
-                locs[label] = (
-                    st.session_state.flow_map_lat,
-                    st.session_state.flow_map_lon,
-                )
+                locs[label] = (st.session_state.flow_map_lat, st.session_state.flow_map_lon)
                 _save_custom_locations(locs)
-                ws.update_location(
-                    st.session_state.flow_map_lat,
-                    st.session_state.flow_map_lon,
-                    label,
-                )
+                ws.update_location(st.session_state.flow_map_lat,
+                                   st.session_state.flow_map_lon, label)
                 st.rerun()
     else:
         lat, lon = coords
@@ -687,8 +753,8 @@ def render_weather_sidebar(ws: WeatherService):
         return
 
     # ── Main condition card ────────────────────────────────────────────────────
-    rain_color = "#e74c3c" if w["rain_intensity"] >= 0.75 else \
-                 "#f39c12" if w["rain_intensity"] >= 0.40 else "#2ecc71"
+    rain_color = ("#e74c3c" if w["rain_intensity"] >= 0.75 else
+                  "#f39c12" if w["rain_intensity"] >= 0.40 else "#2ecc71")
 
     st.markdown(f"""
 <div style="background:rgba(0,180,255,0.07);border:1px solid rgba(0,180,255,0.18);
@@ -705,19 +771,14 @@ def render_weather_sidebar(ws: WeatherService):
       <div style="font-size:22px;font-weight:800;color:var(--accent-cyan);">
         {w['temperature']}°C
       </div>
-      <div style="font-size:10px;color:var(--text-muted);">
-        Feels {w['feels_like']}°C
-      </div>
+      <div style="font-size:10px;color:var(--text-muted);">Feels {w['feels_like']}°C</div>
     </div>
   </div>
-
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;color:var(--text-secondary);">
     <div>💧 Humidity: <strong>{w['humidity']}%</strong></div>
     <div>💨 Wind: <strong>{w['wind_speed']} km/h</strong></div>
     <div>🌧️ Rain: <strong>{w['rain_mm']} mm/h</strong></div>
-    <div style="color:{rain_color};">
-      ⚡ Intensity: <strong>{w['rain_intensity']:.2f}</strong>
-    </div>
+    <div style="color:{rain_color};">⚡ Intensity: <strong>{w['rain_intensity']:.2f}</strong></div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -725,96 +786,71 @@ def render_weather_sidebar(ws: WeatherService):
     # ── 24-HOUR FORECAST — horizontal scrollable with NOW marker ───────────────
     forecast = ws.get_forecast(hours=24)
     if forecast:
+        is_owm    = ws.provider == "openweathermap"
+        card_w    = "90px" if is_owm else "62px"
+        icon_size = "22px" if is_owm else "20px"
+        label_h   = "32px" if is_owm else "28px"
+
         st.markdown(
             '<div style="font-size:10px;color:var(--text-muted);'
             'letter-spacing:1px;margin:8px 0 4px;">24-HOUR FORECAST</div>',
             unsafe_allow_html=True,
         )
 
-        # Determine current hour string "HH:MM" to match against forecast slots
-        now_label = datetime.now().strftime("%H:%M")
-        # Find the closest forecast slot to now
-        now_hour  = datetime.now().hour
-        now_idx   = 0
-        for _i, _h in enumerate(forecast):
-            try:
-                _slot_hour = int(_h["time"][-5:].split(":")[0])
-                if _slot_hour == now_hour:
-                    now_idx = _i
-                    break
-            except Exception:
-                pass
-
-        # Build one vertical card per hour for horizontal layout
         cards_html = ""
         for idx, h in enumerate(forecast):
-            hour_label = h["time"][-5:]   # "HH:MM"
-            is_now     = (idx == now_idx)
-            rain_col   = (
-                "#e74c3c" if h["rain_intensity"] >= 0.75 else
-                "#f39c12" if h["rain_intensity"] >= 0.40 else
-                "#3498db" if h["rain_mm"] > 0 else
-                "var(--text-muted)"
-            )
+            hour_label = h["time"][-5:]
 
-            if is_now:
-                # Highlighted NOW card
-                now_marker = '<div style="font-size:9px;font-weight:800;color:#fff;background:#00b4ff;border-radius:4px;padding:1px 5px;text-align:center;letter-spacing:1px;margin-bottom:4px;">NOW</div>'
-                card_border = "border:1.5px solid #00b4ff;background:rgba(0,180,255,0.18);"
-                time_color  = "#00d4ff"
-                temp_color  = "#00d4ff"
-            else:
-                now_marker  = ""
-                card_border = "border:1px solid rgba(0,180,255,0.12);background:rgba(0,180,255,0.04);"
-                time_color  = "var(--text-primary)"
-                temp_color  = "var(--accent-cyan)"
+            if is_owm:
+                try:
+                    hh = int(hour_label.split(":")[0])
+                    hour_label = f"{hh:02d}\u2013{(hh+3)%24:02d}h"
+                except Exception:
+                    pass
+
+            rain_col = ("#e74c3c" if h["rain_intensity"] >= 0.75 else
+                        "#f39c12" if h["rain_intensity"] >= 0.40 else
+                        "#3498db" if h["rain_mm"] > 0 else "var(--text-muted)")
+
+            card_border = "border:1px solid rgba(0,180,255,0.12);background:rgba(0,180,255,0.04);"
+            time_color  = "var(--text-primary)"
+            temp_color  = "var(--accent-cyan)"
 
             cards_html += f"""
 <div style="display:inline-flex;flex-direction:column;align-items:center;
-            min-width:62px;max-width:62px;
-            padding:8px 4px 6px;
-            border-radius:8px;
+            min-width:{card_w};max-width:{card_w};
+            padding:8px 4px 6px;border-radius:8px;
             {card_border}
             margin-right:5px;flex-shrink:0;vertical-align:top;">
-  {now_marker}
   <div style="font-size:11px;font-weight:600;color:{time_color};
               margin-bottom:5px;white-space:nowrap;">{hour_label}</div>
-  <div style="font-size:20px;line-height:1;margin-bottom:4px;">{h['condition_icon']}</div>
+  <div style="font-size:{icon_size};line-height:1;margin-bottom:4px;">{h['condition_icon']}</div>
   <div style="font-size:10px;color:var(--text-secondary);text-align:center;
               white-space:normal;line-height:1.2;margin-bottom:5px;
-              min-height:28px;">{h['condition_label']}</div>
+              min-height:{label_h};">{h['condition_label']}</div>
   <div style="font-size:12px;font-weight:700;color:{temp_color};
               margin-bottom:3px;">{h['temperature']}°C</div>
   <div style="font-size:10px;color:{rain_col};">{h['rain_mm']}mm</div>
 </div>"""
 
         st.markdown(f"""
-<div style="background:rgba(0,180,255,0.04);
-            border:1px solid rgba(0,180,255,0.15);
-            border-radius:8px;
-            overflow-x:auto;
-            overflow-y:hidden;
-            padding:10px 8px 8px;
-            white-space:nowrap;
-            scrollbar-width:thin;
-            scrollbar-color:rgba(0,180,255,0.3) transparent;">
+<div style="background:rgba(0,180,255,0.04);border:1px solid rgba(0,180,255,0.15);
+            border-radius:8px;overflow-x:auto;overflow-y:hidden;
+            padding:10px 8px 8px;white-space:nowrap;
+            scrollbar-width:thin;scrollbar-color:rgba(0,180,255,0.3) transparent;">
   {cards_html}
 </div>
 """, unsafe_allow_html=True)
 
-    # ── Stale data warning ─────────────────────────────────────────────────────
     if ws.is_stale:
         st.warning("⚠ Weather data is stale — check internet connection.")
     else:
-        fetched_at = datetime.fromtimestamp(ws._last_fetch).strftime("%H:%M")
-        st.caption(f"Updated {fetched_at} · Refreshes every 5 min · Google Weather API")
+        fetched_at = datetime.fromtimestamp(ws._backend._last_fetch).strftime("%H:%M")
+        st.caption(f"Updated {fetched_at} · Refreshes every 5 min · {ws.provider_label}")
 
 
 def render_weather_main_panel(ws: WeatherService):
-    """
-    Render an expanded weather card for the main dashboard area.
-    Call inside any st.container() or column.
-    """
+    """Render an expanded weather card for the main dashboard area."""
     import streamlit as st
 
     w        = ws.get_current()

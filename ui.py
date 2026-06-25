@@ -1,3 +1,4 @@
+from icons import icon_html, icon_label
 """
 FLOW — Flood Level Observation Warning System
 UI Module: Streamlit dashboard styling and reusable components
@@ -639,18 +640,51 @@ def render_risk_panel(risk: str, confidence: float, probabilities: Dict):
 
 
 def render_roi_counts(counts: Dict[str, int]):
-    ICONS = {
-        "bottle": "🍶",
-        "plastic_waste": "🛍",
-        "log": "🪵",
-        "branch": "🌿",
-        "trash": "🗑",
-        "river_debris": "🌊",
+    # Icon pool — known classes get a specific emoji, any new class from best.pt
+    # automatically falls back to a cycling set of distinct symbols.
+    KNOWN_ICONS: Dict[str, str] = {
+        # Original classes
+        "bottle":       "package",
+        "plastic_waste":"trash-2",
+        "log":          "minus",
+        "branch":       "git-branch",
+        "trash":        "trash-2",
+        "river_debris": "waves",
+        # Common new classes — add more here as needed
+        "tire":         "circle",
+        "tyre":         "circle",
+        "can":          "cylinder",
+        "bag":          "shopping-bag",
+        "foam":         "square",
+        "wood":         "minus",
+        "cloth":        "layers",
+        "paper":        "file-text",
+        "metal":        "settings",
+        "glass":        "square",
+        "carton":       "package",
+        "styrofoam":    "square",
+        "polystyrene":  "square",
+        "tin":          "cylinder",
+        "aluminium":    "cylinder",
+        "aluminum":     "cylinder",
+        "food_container": "package",
+        "food container": "package",
+        "plastic":      "trash-2",
     }
+    FALLBACK_ICONS = ["box", "triangle", "circle", "square", "star", "disc", "hexagon", "diamond", "triangle", "circle"]
+
+    # Assign icons: known classes get their emoji, unknown classes cycle through fallbacks
+    unknown_labels = [l for l in sorted(counts.keys()) if l.lower() not in KNOWN_ICONS]
+    fallback_map = {
+        label: FALLBACK_ICONS[i % len(FALLBACK_ICONS)]
+        for i, label in enumerate(unknown_labels)
+    }
+
     total = sum(counts.values())
     items_html = ""
     for label, count in sorted(counts.items(), key=lambda x: -x[1]):
-        icon = ICONS.get(label, "●")
+        _icon_key = KNOWN_ICONS.get(label.lower(), fallback_map.get(label, "box"))
+        icon = icon_html(_icon_key, size=12, color=color)
         items_html += f"""
 <div class="roi-item">
     <span class="roi-label">{icon} {label.replace('_', ' ').title()}</span>
@@ -670,7 +704,7 @@ def render_alerts(alerts: List[Dict]):
     if not alerts:
         st.markdown("""
 <div style="text-align:center;padding:20px;color:var(--text-muted);font-size:13px;">
-    ✓ No active alerts — system nominal
+    No active alerts — system nominal
 </div>""", unsafe_allow_html=True)
         return
 
@@ -697,7 +731,7 @@ def render_alerts(alerts: List[Dict]):
 
 
 def render_rain_panel(is_rain: bool, rain_intensity: float,
-                      rain_category: str = "", use_live_weather: bool = False):
+                      rain_category: str = "", use_live_weather: bool = False, is_day: bool = True):
     """
     Render the rain status metric card.
 
@@ -709,6 +743,7 @@ def render_rain_panel(is_rain: bool, rain_intensity: float,
                        When provided this overrides the internal label logic.
     use_live_weather : When True, titles the card as 'Live Rain Condition'
                        instead of 'Rain Simulation'.
+    is_day           : True during daytime, False at night. Used for conditional emoji selection.
     """
     # ── Resolve label ──────────────────────────────────────────────────────────
     if rain_category:
@@ -727,52 +762,54 @@ def render_rain_panel(is_rain: bool, rain_intensity: float,
     # ── Resolve icon + color ───────────────────────────────────────────────────
     # Map is keyed on substrings of the WMO condition label so it works for both
     # live weather labels (e.g. "Slight Showers") and simulation labels.
+    # Each entry can have conditional emoji: (substring, day_emoji, night_emoji, color)
+    # (substring, day_icon, night_icon, color)
+    # icon names are keys from icons.py icon_html()
     _LABEL_STYLE = [
-        # (substring,          emoji,  color)
-        ("Clear",              "☀️",   "var(--text-muted)"),
-        ("Mainly Clear",       "🌤️",   "#2ecc71"),
-        ("Partly Cloudy",      "⛅",   "var(--text-muted)"),
-        ("Overcast",           "☁️",   "var(--text-muted)"),
-        ("Fog",                "🌫️",   "var(--text-muted)"),
-        ("Icy Fog",            "🌫️",   "var(--text-muted)"),
-        ("Light Drizzle",      "🌦️",   "#2ecc71"),
-        ("Moderate Drizzle",   "🌦️",   "#2ecc71"),
-        ("Heavy Drizzle",      "🌧️",   "#f39c12"),
-        ("Slight Rain",        "🌦️",   "#2ecc71"),
-        ("Slight Shower",      "🌦️",   "#2ecc71"),
-        ("Moderate Rain",      "🌧️",   "#f39c12"),
-        ("Moderate Shower",    "🌧️",   "#f39c12"),
-        ("Heavy Rain",         "🌧️",   "#e67e22"),
-        ("Violent Shower",     "⛈️",   "#e74c3c"),
-        ("Violent",            "⛈️",   "#e74c3c"),
-        ("Thunderstorm",       "⛈️",   "#e74c3c"),
-        ("Snow",               "🌨️",   "#7ba3cc"),
-        ("No Rain",            "☀️",   "var(--text-muted)"),
-        ("No Rainfall",        "☀️",   "var(--text-muted)"),
-        ("Unavailable",        "⚠️",   "var(--text-muted)"),
+        ("Clear",              "sun",        "moon",        "var(--text-muted)"),
+        ("Mainly Clear",       "sun",        "moon",        "#2ecc71"),
+        ("Partly Cloudy",      "cloud-sun",  "cloud",       "var(--text-muted)"),
+        ("Overcast",           "cloud",      "cloud",       "var(--text-muted)"),
+        ("Fog",                "wind",       "wind",        "var(--text-muted)"),
+        ("Icy Fog",            "wind",       "wind",        "var(--text-muted)"),
+        ("Light Drizzle",      "cloud-rain", "cloud-rain",  "#2ecc71"),
+        ("Moderate Drizzle",   "cloud-rain", "cloud-rain",  "#2ecc71"),
+        ("Heavy Drizzle",      "cloud-rain", "cloud-rain",  "#f39c12"),
+        ("Slight Rain",        "cloud-rain", "cloud-rain",  "#2ecc71"),
+        ("Slight Shower",      "cloud-rain", "cloud-rain",  "#2ecc71"),
+        ("Moderate Rain",      "cloud-rain", "cloud-rain",  "#f39c12"),
+        ("Moderate Shower",    "cloud-rain", "cloud-rain",  "#f39c12"),
+        ("Heavy Rain",         "cloud-rain", "zap",         "#e67e22"),
+        ("Violent Shower",     "zap",        "zap",         "#e74c3c"),
+        ("Violent",            "zap",        "zap",         "#e74c3c"),
+        ("Thunderstorm",       "zap",        "zap",         "#e74c3c"),
+        ("Snow",               "snowflake",  "snowflake",   "#7ba3cc"),
+        ("No Rain",            "sun",        "moon",        "var(--text-muted)"),
+        ("No Rainfall",        "sun",        "moon",        "var(--text-muted)"),
+        ("Unavailable",        "alert-triangle", "alert-triangle", "var(--text-muted)"),
     ]
 
-    drop_anim = "🌧️"          # safe default
-    color     = "#f39c12"
+    _icon_name = "cloud-rain"   # safe default
+    color      = "#f39c12"
 
     label_lower = intensity_label.lower()
-    for substring, emoji, clr in _LABEL_STYLE:
+    for substring, day_icon, night_icon, clr in _LABEL_STYLE:
         if substring.lower() in label_lower:
-            drop_anim = emoji
-            color     = clr
+            _icon_name = day_icon if is_day else night_icon
+            color      = clr
             break
 
     # For simulation mode, "No Rain" should also catch intensity == 0
     if not use_live_weather and rain_intensity <= 0.0:
-        drop_anim = "☀️"
-        color     = "var(--text-muted)"
+        _icon_name = "sun" if is_day else "moon"
+        color      = "var(--text-muted)"
 
     panel_title = "Live Rain Condition" if use_live_weather else "Rain Simulation"
 
     st.markdown(f"""
 <div class="metric-card">
     <div class="metric-label">{panel_title}</div>
-    <div style="font-size:24px;margin:8px 0;">{drop_anim}</div>
+    <div style="margin:8px 0;">{icon_html(_icon_name, size=28, color=color)}</div>
     <div style="font-size:15px;font-weight:600;color:{color};">{intensity_label}</div>
     <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">Intensity: {rain_intensity:.3f}</div>
 </div>
@@ -787,6 +824,7 @@ def render_polygon_editor_html(
     cam_index: int = 0,
     draw_target: str = "debris",
     show_save_btn: bool = True,
+    video_src: str = None,
 ) -> str:
     """
     Return a self-contained HTML string for the interactive polygon editor.
@@ -804,12 +842,18 @@ def render_polygon_editor_html(
     bg_w / bg_h    : pixel dimensions of the canvas.
     existing_points: list of (x, y) tuples to pre-populate.
     cam_index      : browser camera device index (0 = default).
-    draw_target    : "debris" | "gauge"  — shapes button labels and payload.
+    draw_target    : "debris" | "gauge" | "video"  — shapes button labels and payload.
     show_save_btn  : whether to show the "Save to Config" button.
+    video_src      : optional data: URI (e.g. "data:video/mp4;base64,....") of a
+                     pre-recorded clip. When provided, the canvas plays this video
+                     on loop instead of requesting the live webcam — used for
+                     'Draw Polygon for Video' mode.
     """
     pts_js          = str([[p[0], p[1]] for p in existing_points])
-    apply_label     = "✅ Apply Gauge ROI" if draw_target == "gauge" else "✅ Apply Polygon ROI"
+    apply_label     = "Apply Gauge ROI" if draw_target == "gauge" else "Apply Polygon ROI"
     save_display    = "block" if show_save_btn else "none"
+    video_src_js    = "null" if not video_src else f'"{video_src}"'
+    initial_status  = "Loading video…" if video_src else "Requesting webcam access…"
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -873,11 +917,11 @@ def render_polygon_editor_html(
 </head>
 <body>
 
-<div id="cam-status">📷 Requesting webcam access…</div>
+<div id="cam-status">{initial_status}</div>
 
 <div id="infobar">
-  <span>🖱 <b>Left-click</b> add point</span>
-  <span>🖱 <b>Right-click</b> undo</span>
+  <span><b>Left-click</b> add point</span>
+  <span><b>Right-click</b> undo</span>
   <span>⌨ <b>R</b> reset</span>
   <span>⌨ <b>Z</b> undo last</span>
   <div id="pt-count">0 points</div>
@@ -895,7 +939,7 @@ def render_polygon_editor_html(
 
 <div id="btn-row">
   <button id="apply-btn"  class="roi-btn" disabled>{apply_label}</button>
-  <button id="save-btn"   class="roi-btn" disabled>💾 Save to Config</button>
+  <button id="save-btn"   class="roi-btn" disabled>Save to Config</button>
   <button id="cancel-btn" class="roi-btn">✕ Cancel</button>
 </div>
 <div id="status-msg"></div>
@@ -907,6 +951,7 @@ def render_polygon_editor_html(
   const CAM_INDEX  = {cam_index};
   const INIT_PTS   = {pts_js};
   const DRAW_TARGET = "{draw_target}";
+  const VIDEO_SRC   = {video_src_js};
 
   const video      = document.getElementById("liveVideo");
   const canvas     = document.getElementById("bgCanvas");
@@ -957,19 +1002,42 @@ def render_polygon_editor_html(
       video.addEventListener("playing", () => {{
         videoReady = true;
         camStatus.style.color = "#00e676";
-        camStatus.textContent = "📷 Live — draw your polygon";
+        camStatus.textContent = "Live — draw your polygon";
       }});
       await video.play();
     }} catch(err) {{
       camStatus.style.color = "#e74c3c";
       const denied = err.name === "NotAllowedError" || err.name === "PermissionDeniedError";
       camStatus.textContent = denied
-        ? "⚠ Camera permission denied — allow camera in your browser address bar, then reload"
-        : "⚠ Camera error: " + err.message;
+        : "Camera permission denied — allow camera in your browser address bar, then reload"
+        : "Camera error: " + err.message;
     }}
   }}
 
-  startCamera();
+  // ── Video file (pre-recorded clip) ───────────────────────────────────────────────────────────────
+  function startVideoFile() {{
+    camStatus.style.color = "#7ba3cc";
+    camStatus.textContent = "Loading video…";
+    video.src        = VIDEO_SRC;
+    video.loop       = true;
+    video.muted      = true;
+    video.playsInline = true;
+    video.addEventListener("playing", () => {{
+      videoReady = true;
+      camStatus.style.color = "#00e676";
+      camStatus.textContent = "Live video — draw your polygon";
+    }});
+    video.play().catch(err => {{
+      camStatus.style.color = "#e74c3c";
+      camStatus.textContent = "Video playback error: " + err.message;
+    }});
+  }}
+
+  if (VIDEO_SRC) {{
+    startVideoFile();
+  }} else {{
+    startCamera();
+  }}
 
   window.addEventListener("beforeunload", () => {{
     if (window._flowStream) {{
@@ -989,7 +1057,7 @@ def render_polygon_editor_html(
       ctx.fillStyle = "#4a6b8a";
       ctx.font = "16px sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("Waiting for webcam...", CANVAS_W/2, CANVAS_H/2);
+      ctx.fillText(VIDEO_SRC ? "Loading video..." : "Waiting for webcam...", CANVAS_W/2, CANVAS_H/2);
       ctx.textAlign = "left";
     }}
     drawPolygon();
@@ -1075,10 +1143,10 @@ def render_polygon_editor_html(
         }});
         showStatus("⏳ Applying…", "ok");
       }} else {{
-        showStatus("⚠ Could not reach Streamlit input — please use the buttons below.", "err");
+        showStatus("Could not reach Streamlit input — please use the buttons below.", "err");
       }}
     }} catch(err) {{
-      showStatus("⚠ Error: " + err.message, "err");
+      showStatus("Error: " + err.message, "err");
       console.warn("[FLOW ROI] DOM bridge failed:", err);
     }}
   }}

@@ -29,6 +29,7 @@ from ui import (
     render_roi_counts, render_alerts, render_rain_panel,
     render_polygon_editor_html,
 )
+from icons import icon_html, icon_label
 from utils import resize_frame, get_timestamp
 from datetime import timezone, timedelta
 MYT = timezone(timedelta(hours=8))
@@ -40,10 +41,13 @@ from flood_risk_engine import FloodRiskEngine
 # ── Water Level Module ────────────────────────────────────────────────────────
 from water_level import WaterLevelMonitor
 
+# ── Rain Validation Module (camera-based CV cross-check) ───────────────────────
+from rain_validation.composite import CompositeRainValidator, render_cv_validation_panel
+
 # ─── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="FLOW — Flood Level Observation Warning System",
-    page_icon="🌊",
+    page_icon="Flow.ico",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -102,6 +106,14 @@ def get_flood_risk_engine():
     """Persistent FloodRiskEngine — runs weather-based scoring even before START."""
     return FloodRiskEngine()
 
+@st.cache_resource
+def get_rain_validator():
+    """
+    Persistent CompositeRainValidator — holds inter-frame state (prev_gray, etc.)
+    across Streamlit reruns by living inside the cache.
+    """
+    return CompositeRainValidator(use_streak_detection=True)
+
 # Initialise DB once
 init_db()
 
@@ -114,6 +126,7 @@ weather_svc  = get_weather_service()
 wl_monitor   = get_water_level_monitor()
 telegram     = get_telegram_notifier()
 risk_engine  = get_flood_risk_engine()
+rain_validator = get_rain_validator()
 
 # ─── Session State Defaults ────────────────────────────────────────────────────
 def _init_state():
@@ -145,6 +158,10 @@ def _init_state():
         "roi_editor_points":  [],
         "roi_editor_result":  "",
         "roi_editor_saved":   False,
+        "roi_draw_video_picker": False,   # showing the video-picker UI
+        "roi_draw_video_path":   None,    # path of the .mp4 chosen for video ROI drawing
+        "wl_gauge_draw_video_picker": False,  # showing the gauge video-picker UI
+        "wl_gauge_draw_video_path":   None,   # path of the .mp4 chosen for gauge ROI drawing
         # Water level
         "water_level_enabled": True,
         "wl_gauge_roi":        [],   # persisted gauge ROI polygon points
@@ -160,6 +177,9 @@ def _init_state():
         "wl_thresh_critical":  180,
         # Telegram notifications
         "tg_enabled":          False,
+        # Camera rain validation (CV)
+        "cv_rain_enabled":     True,
+        "cv_rain_result":      None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -179,6 +199,7 @@ def get_worker_state():
     return {
         "lock":          threading.Lock(),
         "running":       False,
+        "frame_jpeg":    None,
         "frame_rgb":     None,
         "fps":           0.0,
         "frame_count":   0,
@@ -217,6 +238,9 @@ def get_worker_state():
         "wl_thresh_critical":  180,
         # Telegram
         "tg_enabled":       False,
+        # Camera rain validation (CV)
+        "cv_rain_enabled":  True,
+        "cv_rain_result":   None,
     }
 
 worker_state = get_worker_state()
@@ -238,6 +262,7 @@ def stop_worker():
     thread_ref["thread"] = None
     tracker.reset()
     telegram.reset_state()
+    rain_validator.reset()    # clears prev_gray so disturbance doesn't glitch on restart
 
 def start_worker():
     """Spawn the background thread if not already running."""
@@ -257,6 +282,7 @@ def start_worker():
         "wl_enabled":       st.session_state.get("water_level_enabled", True),
         "tg_enabled":       st.session_state.get("tg_enabled", False),
         "wl_gauge_roi":     st.session_state.get("wl_gauge_roi", []),
+        "cv_rain_enabled":  st.session_state.get("cv_rain_enabled", True),
     })
     t = threading.Thread(target=camera_worker, args=(worker_state,), daemon=True)
     t.start()
@@ -281,22 +307,39 @@ with st.sidebar:
     # Theme toggle
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("☀ Light", use_container_width=True):
+        if st.button("☀  Light", use_container_width=True):
             st.session_state.theme = "light"
             st.rerun()
     with col_b:
-        if st.button("🌙 Dark", use_container_width=True):
+        if st.button("☾  Dark", use_container_width=True):
             st.session_state.theme = "dark"
             st.rerun()
 
     st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
 
     # ── Monitoring Controls ───────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-label">📷 MONITORING</div>', unsafe_allow_html=True)
+    st.markdown(icon_label("camera", "MONITORING"), unsafe_allow_html=True)
+
+    # ── Build camera options (static + any .mp4 files in the video/ folder) ──
+    import os as _os
+    _video_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "video")
+    _os.makedirs(_video_dir, exist_ok=True)  # ensure folder exists
+    _mp4_files = sorted([f for f in _os.listdir(_video_dir) if f.lower().endswith(".mp4")])
 
     cam_options = {"Webcam (0)": 0, "Webcam (1)": 1, "Demo Mode": "demo"}
+    for _mp4 in _mp4_files:
+        _label = f"{_mp4}"
+        cam_options[_label] = _os.path.join(_video_dir, _mp4)
+
+    if not _mp4_files:
+        _video_hint = "(drop .mp4 files into the **video/** folder to use them here)"
+    else:
+        _video_hint = f"{len(_mp4_files)} video file(s) found in **video/**"
+
     cam_choice = st.selectbox("Camera Source", list(cam_options.keys()), key="cam_select")
     st.session_state.cam_source = cam_options[cam_choice]
+    if _mp4_files or cam_choice in [f"{f}" for f in _mp4_files]:
+        st.caption(_video_hint)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -330,7 +373,7 @@ with st.sidebar:
     st.markdown("<hr style='border-color:#1e3a5f;'>", unsafe_allow_html=True)
 
     # ── Detection Settings ────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-label">🎯 DETECTION</div>', unsafe_allow_html=True)
+    st.markdown(icon_label("crosshair", "DETECTION"), unsafe_allow_html=True)
 
     conf_val = st.slider(
         "Confidence Threshold", 0.10, 0.90,
@@ -346,25 +389,25 @@ with st.sidebar:
     st.markdown("<hr style='border-color:#1e3a5f;'>", unsafe_allow_html=True)
 
     # ── ROI Polygon ───────────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-label">🔷 POLYGON ROI</div>', unsafe_allow_html=True)
+    st.markdown(icon_label("polygon", "POLYGON ROI"), unsafe_allow_html=True)
 
     # Show current polygon status
     n_pts = len(roi.get_polygon())
     if n_pts >= 3:
         st.markdown(
             f'<div style="font-size:11px;color:#00e676;margin-bottom:8px;">'
-            f'✓ Active polygon: {n_pts} points</div>',
+            f'{icon_html("check-circle", size=12, color="#00e676")} Active polygon: {n_pts} points</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
             '<div style="font-size:11px;color:#f39c12;margin-bottom:8px;">'
-            '⚠ No polygon set — full frame monitored</div>',
+            f'{icon_html("alert-triangle", size=12, color="#f39c12")} No polygon set — full frame monitored</div>',
             unsafe_allow_html=True,
         )
 
     draw_mode_btn = st.button(
-        "✏ Draw Polygon" if not st.session_state.get("draw_mode") else "✕ Cancel Drawing",
+        "Draw Polygon" if not st.session_state.get("draw_mode") else "Cancel Drawing",
         use_container_width=True,
         key="toggle_draw_mode_btn",
         type="primary" if not st.session_state.get("draw_mode") else "secondary",
@@ -374,9 +417,58 @@ with st.sidebar:
         if st.session_state.draw_mode:
             st.session_state.draw_mode_target = "debris"
             st.session_state.roi_draw_capture_requested = True
+            st.session_state.roi_draw_video_path = None  # webcam mode
         st.rerun()
 
-    if st.button("🗑 Clear Polygon", use_container_width=True, key="clear_poly_btn"):
+    # ── Draw Polygon for Video — pick an .mp4, draw ROI on its live playback ──
+    _vid_draw_active = (
+        st.session_state.get("draw_mode", False)
+        and st.session_state.get("roi_draw_video_path") is not None
+    )
+    if not _vid_draw_active:
+        if st.session_state.get("roi_draw_video_picker", False):
+            if _mp4_files:
+                _chosen_mp4_name = st.selectbox(
+                    "Select video for ROI drawing:",
+                    _mp4_files,
+                    key="roi_video_picker_select",
+                )
+                _col_pick1, _col_pick2 = st.columns(2)
+                with _col_pick1:
+                    if st.button("Open", use_container_width=True, key="roi_video_open_btn"):
+                        _chosen_path = _os.path.join(_video_dir, _chosen_mp4_name)
+                        st.session_state.roi_draw_video_picker   = False
+                        st.session_state.roi_draw_video_path     = _chosen_path
+                        st.session_state.draw_mode               = True
+                        st.session_state.draw_mode_target        = "debris"
+                        st.session_state.roi_draw_capture_requested = False
+                        st.session_state.roi_editor_points       = []
+                        st.session_state.roi_editor_result       = "[]"
+                        st.rerun()
+                with _col_pick2:
+                    if st.button("Cancel", use_container_width=True, key="roi_video_cancel_btn"):
+                        st.session_state.roi_draw_video_picker = False
+                        st.rerun()
+            else:
+                st.markdown(
+                    '<div style="font-size:11px;color:#f39c12;margin-bottom:6px;">'
+                    f'{icon_html("alert-triangle", size=12, color="#f39c12")} No .mp4 files in <b>video/</b> — drop files there first</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Close", use_container_width=True, key="roi_video_close_btn"):
+                    st.session_state.roi_draw_video_picker = False
+                    st.rerun()
+        else:
+            if st.button(
+                "Draw Polygon for Video",
+                use_container_width=True,
+                key="draw_polygon_video_btn",
+                help="Choose an MP4 from video/ and draw the ROI polygon on top of it.",
+            ):
+                st.session_state.roi_draw_video_picker = True
+                st.rerun()
+
+    if st.button("Clear Polygon", use_container_width=True, key="clear_poly_btn"):
         roi.polygon = []
         roi._area = 1.0
         st.session_state.roi_editor_points = []
@@ -406,7 +498,7 @@ with st.sidebar:
     st.markdown(
         f'<div style="background:rgba(0,0,0,0.18);border:1px solid rgba(255,255,255,0.07);'
         f'border-radius:8px;padding:8px 10px;margin:8px 0 4px;">'
-        f'<div style="font-size:10px;letter-spacing:1px;color:#4a6b8a;margin-bottom:5px;">🌧 WEATHER FLOOD RISK</div>'
+        f'<div style="font-size:10px;letter-spacing:1px;color:#4a6b8a;margin-bottom:5px;">{icon_html("cloud-rain", size=12, color="#4a6b8a")} WEATHER FLOOD RISK</div>'
         f'<div style="display:flex;justify-content:space-between;align-items:center;">'
         f'<span style="font-size:12px;font-weight:700;color:{_cat["color"]};">'
         f'{_cat["label"]}</span>'
@@ -414,9 +506,9 @@ with st.sidebar:
         f'</div>'
         f'<div style="display:flex;justify-content:space-between;font-size:10px;color:#888;margin-top:3px;">'
         f'<span>Score: <b style="color:{_sc["color"]};">{_sc["score"]:.1f}</b> → <b>{_sc["category"]}</b></span>'
-        f'<span>⏱ {_cat["continuous_hours"]:.1f}h</span>'
+        f'<span>{_cat["continuous_hours"]:.1f}h</span>'
         f'</div>'
-        + (f'<div style="font-size:9px;color:#f39c12;margin-top:3px;">⚠ {_cat["upgrade_reason"]}</div>'
+        + (f'<div style="font-size:9px;color:#f39c12;margin-top:3px;">{icon_html("alert-triangle", size=10, color="#f39c12")} {_cat["upgrade_reason"]}</div>'
            if _cat.get("upgrade_reason") else '')
         + f'</div>',
         unsafe_allow_html=True,
@@ -424,7 +516,7 @@ with st.sidebar:
 
     # Live weather toggle — when ON, use live rain data; when OFF, use slider
     use_live_weather = st.checkbox(
-        "📡 Use Live Weather for Prediction",
+        "Use Live Weather for Prediction",
         value=st.session_state.get("use_live_weather", True),
         key="use_live_weather_chk",
         help="When enabled, flood prediction uses live rain intensity from the weather API. "
@@ -438,16 +530,18 @@ with st.sidebar:
             wx = weather_svc.get_current()
             live_rain_mm_h = float(wx.get("rain_mm", 0.0))
             live_rain_norm = wx.get("rain_intensity", 0.0)   # already 0-1 from _rain_to_intensity
+            condition_emoji = ""
             # Also keep risk_engine in sync with manual-mode mm/h value
             risk_engine.update_weather(live_rain_mm_h)
         except Exception:
             live_rain_mm_h = 0.0
             live_rain_norm = 0.0
+            condition_emoji = ""
         st.session_state.rain_enabled   = False   # no visual simulation overlay
         st.session_state.rain_intensity = live_rain_norm
         st.markdown(
             f'<div style="font-size:11px;color:#00d4ff;margin:4px 0 2px;">'
-            f'🌧 Live rain: <b>{live_rain_mm_h:.1f} mm/h</b> · intensity <b>{live_rain_norm:.3f}</b> '
+            f'{icon_html("cloud-rain", size=12, color="#00d4ff")} Live rain: <b>{live_rain_mm_h:.1f} mm/h</b> · intensity <b>{live_rain_norm:.3f}</b> '
             f'(used for flood prediction)</div>',
             unsafe_allow_html=True,
         )
@@ -455,7 +549,7 @@ with st.sidebar:
         # Manual rain simulation
         st.markdown(
             '<div style="font-size:11px;color:#f39c12;margin:6px 0 4px;">'
-            '🌧 <b>Rain Simulation</b> — drag to set intensity</div>',
+            f'{icon_html("cloud-rain", size=12, color="#f39c12")} <b>Rain Simulation</b> — drag to set intensity</div>',
             unsafe_allow_html=True,
         )
         rain_val = st.slider(
@@ -474,15 +568,15 @@ with st.sidebar:
         if rain_val == 0.0:
             label, color = "No Rain", "#4a6b8a"
         elif rain_val < 0.2:
-            label, color = "Light Drizzle 🌦", "#2ecc71"
+            label, color = "Light Drizzle", "#2ecc71"
         elif rain_val < 0.4:
-            label, color = "Slight Rain 🌦", "#2ecc71"
+            label, color = "Slight Rain", "#2ecc71"
         elif rain_val < 0.6:
-            label, color = "Moderate Rain 🌧", "#f39c12"
+            label, color = "Moderate Rain", "#f39c12"
         elif rain_val < 0.8:
-            label, color = "Heavy Rain 🌧", "#e67e22"
+            label, color = "Heavy Rain", "#e67e22"
         else:
-            label, color = "Violent Showers ⛈", "#e74c3c"
+            label, color = "Violent Showers", "#e74c3c"
         st.markdown(
             f'<div style="font-size:11px;color:{color};margin-top:2px;">{label}</div>',
             unsafe_allow_html=True,
@@ -490,8 +584,29 @@ with st.sidebar:
 
     st.markdown("<hr style='border-color:#1e3a5f;'>", unsafe_allow_html=True)
 
+    # ── Camera Rain Validation ────────────────────────────────────────────────
+    st.markdown(icon_label("eye", "CAMERA RAIN VALIDATION"), unsafe_allow_html=True)
+    cv_rain_enabled = st.checkbox(
+        "Enable CV Rain Validation",
+        value=st.session_state.get("cv_rain_enabled", True),
+        key="cv_rain_enabled_chk",
+        help=(
+            "Use camera-based rain validation to verify whether rain is visible in the scene. "
+            "This lightweight CV layer adds a secondary rain check to the flood prediction."
+        ),
+    )
+    st.session_state["cv_rain_enabled"] = cv_rain_enabled
+    worker_state["cv_rain_enabled"] = cv_rain_enabled
+    if cv_rain_enabled:
+        st.markdown(
+            f'<div style="font-size:10px;color:#4a6b8a;margin-top:2px;">{icon_html("check-circle", size=11, color="#4a6b8a")} Visibility, disturbance, and streak evaluation active.</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<hr style='border-color:#1e3a5f;'>", unsafe_allow_html=True)
+
     # ── Water Level Estimation ────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-label">💧 WATER LEVEL</div>', unsafe_allow_html=True)
+    st.markdown(icon_label("waves", "WATER LEVEL"), unsafe_allow_html=True)
 
     wl_enabled = st.checkbox(
         "Enable Water Level Estimation",
@@ -507,13 +622,13 @@ with st.sidebar:
         if len(_wl_roi_pts) >= 3:
             st.markdown(
                 f'<div style="font-size:11px;color:#00e676;margin-bottom:4px;">'
-                f'✓ Gauge ROI: {len(_wl_roi_pts)} points active</div>',
+                f'{icon_html("check-circle", size=12, color="#00e676")} Gauge ROI: {len(_wl_roi_pts)} points active</div>',
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
                 '<div style="font-size:11px;color:#f39c12;margin-bottom:4px;">'
-                '⚠ No gauge ROI — full frame scanned (false positives likely)</div>',
+                f'{icon_html("alert-triangle", size=12, color="#f39c12")} No gauge ROI — full frame scanned (false positives likely)</div>',
                 unsafe_allow_html=True,
             )
 
@@ -522,7 +637,7 @@ with st.sidebar:
             and st.session_state.get("draw_mode_target") == "gauge"
         )
         wl_draw_btn = st.button(
-            "✏ Draw Gauge ROI" if not _gauge_draw_active else "✕ Cancel Gauge Drawing",
+            "Draw Gauge ROI" if not _gauge_draw_active else "Cancel Gauge Drawing",
             use_container_width=True,
             key="wl_toggle_draw_mode_btn",
             type="primary" if not _gauge_draw_active else "secondary",
@@ -541,26 +656,74 @@ with st.sidebar:
                 st.session_state.roi_editor_result = "[]"
             st.rerun()
 
-        if st.button("🗑 Clear Gauge ROI", use_container_width=True, key="wl_clear_roi_btn"):
+        if st.button("Clear Gauge ROI", use_container_width=True, key="wl_clear_roi_btn"):
             st.session_state.wl_gauge_roi = []
             wl_monitor.set_gauge_roi(None)
             worker_state["wl_gauge_roi"] = []
             st.rerun()
 
+        # ── Draw Gauge ROI for Video — pick an .mp4, draw ROI on its live playback ──
+        _wl_gauge_draw_active = (
+            st.session_state.get("draw_mode", False)
+            and st.session_state.get("wl_gauge_draw_video_path") is not None
+        )
+        if not _wl_gauge_draw_active:
+            if st.session_state.get("wl_gauge_draw_video_picker", False):
+                if _mp4_files:
+                    _chosen_mp4_name = st.selectbox(
+                        "Select video for gauge ROI drawing:",
+                        _mp4_files,
+                        key="wl_gauge_video_picker_select",
+                    )
+                    _col_pick1, _col_pick2 = st.columns(2)
+                    with _col_pick1:
+                        if st.button("Open", use_container_width=True, key="wl_gauge_video_open_btn"):
+                            _chosen_path = _os.path.join(_video_dir, _chosen_mp4_name)
+                            st.session_state.wl_gauge_draw_video_picker   = False
+                            st.session_state.wl_gauge_draw_video_path     = _chosen_path
+                            st.session_state.draw_mode                    = True
+                            st.session_state.draw_mode_target             = "gauge"
+                            st.session_state.roi_draw_capture_requested   = False
+                            st.session_state.roi_editor_points            = []
+                            st.session_state.roi_editor_result            = "[]"
+                            st.rerun()
+                    with _col_pick2:
+                        if st.button("Cancel", use_container_width=True, key="wl_gauge_video_cancel_btn"):
+                            st.session_state.wl_gauge_draw_video_picker = False
+                            st.rerun()
+                else:
+                    st.markdown(
+                        '<div style="font-size:11px;color:#f39c12;margin-bottom:6px;">'
+                        f'{icon_html("alert-triangle", size=12, color="#f39c12")} No .mp4 files in <b>video/</b> — drop files there first</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Close", use_container_width=True, key="wl_gauge_video_close_btn"):
+                        st.session_state.wl_gauge_draw_video_picker = False
+                        st.rerun()
+            else:
+                if st.button(
+                    "Draw Gauge ROI for Video",
+                    use_container_width=True,
+                    key="draw_gauge_roi_video_btn",
+                    help="Choose an MP4 from video/ and draw the gauge ROI polygon on top of it.",
+                ):
+                    st.session_state.wl_gauge_draw_video_picker = True
+                    st.rerun()
+
         if wl_monitor.is_calibrated:
             cal = wl_monitor.calibration
             st.markdown(
                 f'<div style="font-size:11px;color:#00e676;margin-bottom:6px;">'
-                f'✓ Calibrated: {cal.h_min_cm:.0f}–{cal.h_max_cm:.0f} cm</div>',
+                f'{icon_html("check-circle", size=12, color="#00e676")} Calibrated: {cal.h_min_cm:.0f}–{cal.h_max_cm:.0f} cm</div>',
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
                 '<div style="font-size:11px;color:#f39c12;margin-bottom:6px;">'
-                '⚠ Not calibrated — using defaults</div>',
+                f'{icon_html("alert-triangle", size=12, color="#f39c12")} Not calibrated — using defaults</div>',
                 unsafe_allow_html=True,
             )
-        with st.expander("⚙ Calibration", expanded=False):
+        with st.expander("Calibration", expanded=False):
 
             # ── Gauge range (top of the scale) ────────────────────────────────
             _h_max_range = int(wl_monitor.calibration.h_max_cm) or 200
@@ -583,28 +746,28 @@ with st.sidebar:
 
             # ── Four native sliders — each writes directly to session state ───
             wl_thresh_normal = st.slider(
-                "🟢 Normal threshold (cm)",
+                "Normal threshold (cm)",
                 min_value=0, max_value=_h_max_range,
                 value=st.session_state["wl_thresh_normal"],
                 step=1, key="wl_n_slider",
                 help="Below this level the system reports Normal status.",
             )
             wl_thresh_warning = st.slider(
-                "🟡 Warning threshold (cm)",
+                "Warning threshold (cm)",
                 min_value=0, max_value=_h_max_range,
                 value=max(st.session_state["wl_thresh_warning"], wl_thresh_normal + 1),
                 step=1, key="wl_w_slider",
                 help="Above this level the system raises a Warning.",
             )
             wl_thresh_danger = st.slider(
-                "🟠 Danger threshold (cm)",
+                "Danger threshold (cm)",
                 min_value=0, max_value=_h_max_range,
                 value=max(st.session_state["wl_thresh_danger"], wl_thresh_warning + 1),
                 step=1, key="wl_d_slider",
                 help="Above this level the system raises a Danger alert.",
             )
             wl_thresh_critical = st.slider(
-                "🔴 Critical threshold (cm)",
+                "Critical threshold (cm)",
                 min_value=0, max_value=_h_max_range,
                 value=max(st.session_state["wl_thresh_critical"], wl_thresh_danger + 1),
                 step=1, key="wl_c_slider",
@@ -637,11 +800,134 @@ with st.sidebar:
 
             # ── Save button (persists calibration.json) ───────────────────────
             st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
-            if st.button("💾 Save calibration", use_container_width=True, key="wl_cal_save"):
+            if st.button("Save calibration", use_container_width=True, key="wl_cal_save"):
                 if wl_monitor.calibration.save():
                     st.success("Calibration saved.")
                 else:
                     st.error("Save failed.")
+
+        # ── Edge Detector Sensitivity ──────────────────────────────────────────
+        with st.expander("Edge Detector Sensitivity", expanded=False):
+            st.markdown(
+                '<div style="font-size:10px;color:#4a6b8a;margin:0 0 6px;">'
+                'Adjust waterline detection parameters for different lighting & water conditions:</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Initialize session state for detector parameters if not present
+            if "wl_canny_low" not in st.session_state:
+                st.session_state["wl_canny_low"] = wl_monitor.detector.canny_low
+            if "wl_canny_high" not in st.session_state:
+                st.session_state["wl_canny_high"] = wl_monitor.detector.canny_high
+            if "wl_adaptive_block" not in st.session_state:
+                st.session_state["wl_adaptive_block"] = wl_monitor.detector.adaptive_block
+            if "wl_adaptive_c" not in st.session_state:
+                st.session_state["wl_adaptive_c"] = wl_monitor.detector.adaptive_c
+            if "wl_min_contour_area" not in st.session_state:
+                st.session_state["wl_min_contour_area"] = wl_monitor.detector.min_contour_area
+
+            # Canny Edge Detection Thresholds
+            canny_low = st.slider(
+                "Canny Lower Threshold",
+                min_value=10, max_value=150,
+                value=st.session_state["wl_canny_low"],
+                step=5, key="wl_canny_low_slider",
+                help="Lower Canny threshold: higher = fewer edges detected, more sensitive to strong edges only.",
+            )
+            canny_high = st.slider(
+                "Canny Upper Threshold",
+                min_value=50, max_value=300,
+                value=st.session_state["wl_canny_high"],
+                step=10, key="wl_canny_high_slider",
+                help="Upper Canny threshold: higher = fewer edges, lower = more noise.",
+            )
+
+            # Adaptive Threshold Parameters
+            adaptive_block = st.slider(
+                "Adaptive Block Size",
+                min_value=3, max_value=51,
+                value=st.session_state["wl_adaptive_block"],
+                step=2, key="wl_adaptive_block_slider",
+                help="Block size for adaptive thresholding (must be odd). Larger = smoother, smaller = more detail.",
+            )
+            adaptive_c = st.slider(
+                "Adaptive Constant",
+                min_value=0, max_value=30,
+                value=st.session_state["wl_adaptive_c"],
+                step=1, key="wl_adaptive_c_slider",
+                help="Constant subtracted from weighted mean. Higher = more aggressive edge detection.",
+            )
+
+            # Minimum Contour Area
+            min_contour_area = st.slider(
+                "Min Contour Area (px²)",
+                min_value=10, max_value=500,
+                value=st.session_state["wl_min_contour_area"],
+                step=10, key="wl_min_contour_area_slider",
+                help="Minimum area for a contour to be considered (filters noise). Higher = ignores small artifacts.",
+            )
+
+            # Apply changes to detector
+            wl_monitor.detector.canny_low = canny_low
+            wl_monitor.detector.canny_high = canny_high
+            wl_monitor.detector.adaptive_block = adaptive_block
+            wl_monitor.detector.adaptive_c = adaptive_c
+            wl_monitor.detector.min_contour_area = min_contour_area
+
+            # Update session state
+            st.session_state["wl_canny_low"] = canny_low
+            st.session_state["wl_canny_high"] = canny_high
+            st.session_state["wl_adaptive_block"] = adaptive_block
+            st.session_state["wl_adaptive_c"] = adaptive_c
+            st.session_state["wl_min_contour_area"] = min_contour_area
+
+            # Preset buttons for common scenarios
+            st.markdown(
+                '<div style="font-size:10px;color:#4a6b8a;margin:12px 0 6px;">'
+                'Quick Presets:</div>',
+                unsafe_allow_html=True,
+            )
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("Bright", use_container_width=True, key="wl_preset_bright"):
+                    wl_monitor.detector.canny_low = 80
+                    wl_monitor.detector.canny_high = 200
+                    wl_monitor.detector.adaptive_block = 11
+                    wl_monitor.detector.adaptive_c = 5
+                    wl_monitor.detector.min_contour_area = 50
+                    st.session_state["wl_canny_low"] = 80
+                    st.session_state["wl_canny_high"] = 200
+                    st.session_state["wl_adaptive_block"] = 11
+                    st.session_state["wl_adaptive_c"] = 5
+                    st.session_state["wl_min_contour_area"] = 50
+                    st.rerun()
+            with col2:
+                if st.button("Normal", use_container_width=True, key="wl_preset_normal"):
+                    wl_monitor.detector.canny_low = 50
+                    wl_monitor.detector.canny_high = 150
+                    wl_monitor.detector.adaptive_block = 15
+                    wl_monitor.detector.adaptive_c = 8
+                    wl_monitor.detector.min_contour_area = 100
+                    st.session_state["wl_canny_low"] = 50
+                    st.session_state["wl_canny_high"] = 150
+                    st.session_state["wl_adaptive_block"] = 15
+                    st.session_state["wl_adaptive_c"] = 8
+                    st.session_state["wl_min_contour_area"] = 100
+                    st.rerun()
+            with col3:
+                if st.button("Dark", use_container_width=True, key="wl_preset_dark"):
+                    wl_monitor.detector.canny_low = 30
+                    wl_monitor.detector.canny_high = 100
+                    wl_monitor.detector.adaptive_block = 21
+                    wl_monitor.detector.adaptive_c = 12
+                    wl_monitor.detector.min_contour_area = 30
+                    st.session_state["wl_canny_low"] = 30
+                    st.session_state["wl_canny_high"] = 100
+                    st.session_state["wl_adaptive_block"] = 21
+                    st.session_state["wl_adaptive_c"] = 12
+                    st.session_state["wl_min_contour_area"] = 30
+                    st.rerun()
+
         # Live reading
         lv    = st.session_state.get("wl_level_cm")
         lv_txt = f"{lv:.1f} cm" if lv is not None else "--"
@@ -649,7 +935,7 @@ with st.sidebar:
         rt_sign = "+" if rt > 0 else ""
         st.markdown(
             f'<div style="font-size:13px;color:#00d4ff;font-weight:700;">'
-            f'💧 {lv_txt} &nbsp;'
+            f'{icon_html("droplet", size=13, color="var(--accent-cyan)")} {lv_txt} &nbsp;'
             f'<span style="font-size:11px;color:#aaa;">({rt_sign}{rt:.2f} cm/min)</span>'
             f'</div>'
             f'<div style="font-size:11px;color:#aaa;margin-top:2px;">'
@@ -662,14 +948,14 @@ with st.sidebar:
     st.markdown("<hr style='border-color:#1e3a5f;'>", unsafe_allow_html=True)
 
     # ── Alert Thresholds ──────────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-label">🔔 ALERT THRESHOLDS</div>', unsafe_allow_html=True)
+    st.markdown(icon_label("bell", "ALERT THRESHOLDS"), unsafe_allow_html=True)
     blockage_warn_th = st.slider("Blockage Warning (%)", 20, 90, 50, 5)
     roi_warn_th = st.slider("ROI Count Warning", 5, 30, 10, 1)
 
     st.markdown("<hr style='border-color:#1e3a5f;'>", unsafe_allow_html=True)
 
     # ── Telegram Notifications ────────────────────────────────────────────────
-    st.markdown('<div class="sidebar-label">📲 TELEGRAM ALERTS</div>', unsafe_allow_html=True)
+    st.markdown(icon_label("send", "TELEGRAM ALERTS"), unsafe_allow_html=True)
 
     tg_enabled = st.checkbox(
         "Enable Telegram Notifications",
@@ -684,7 +970,7 @@ with st.sidebar:
     sub_color = "#00e676" if sub_count > 0 else "#f39c12"
     st.markdown(
         f'<div style="font-size:11px;color:{sub_color};margin-bottom:6px;">'
-        f'👥 {sub_count} subscriber(s) active</div>',
+        f'{icon_html("users", size=12, color="#00e676")} {sub_count} subscriber(s) active</div>',
         unsafe_allow_html=True,
     )
 
@@ -696,7 +982,7 @@ with st.sidebar:
         'border:1px solid var(--border-color);">'
         '<div style="display:flex;gap:10px;align-items:flex-start;">'
         '<div style="flex:1;">'
-        '📱 <b style="color:var(--text-primary);">How to subscribe:</b><br>'
+        f'{icon_html("message-square", size=12, color="var(--text-muted)")} <b style="color:var(--text-primary);">How to subscribe:</b><br>'
         '1. Open Telegram<br>'
         '2. Search <b><a href="https://t.me/Aiflowsystembot" '
         'target="_blank" style="color:var(--accent-cyan);">@Aiflowsystembot</a></b><br>'
@@ -719,7 +1005,7 @@ with st.sidebar:
     if tg_enabled:
         col_tg1, col_tg2 = st.columns(2)
         with col_tg1:
-            if st.button("🔔 Test", use_container_width=True, key="tg_test_btn"):
+            if st.button("Test Alert", use_container_width=True, key="tg_test_btn"):
                 ok, result_msg = telegram.send_test()
                 if ok:
                     st.success(result_msg)
@@ -733,7 +1019,7 @@ with st.sidebar:
             )
         errs = telegram.last_errors
         if errs:
-            with st.expander("⚠ Send errors", expanded=False):
+            with st.expander("Send errors", expanded=False):
                 for e in errs:
                     st.caption(e)
     else:
@@ -913,10 +1199,10 @@ with metrics_col:
     metric_ph_blockage = st.empty()
     metric_ph_rain     = st.empty()
     metric_ph_risk     = st.empty()
+    metric_ph_cv       = st.empty()
 
-# ── Bottom row: ROI Counts | Risk | Alerts ─────────────────────────────────────
-st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-roi_col, risk_col, alert_col = st.columns([2, 2, 3], gap="medium")
+# ── Second row: ROI counts | Flood Prediction | Alert Center ──────────────────
+roi_col, risk_col, alert_col = st.columns(3, gap="medium")
 
 with roi_col:
     st.markdown('<div class="section-header">ROI Object Count</div>', unsafe_allow_html=True)
@@ -931,7 +1217,7 @@ with alert_col:
     alert_ph = st.empty()
 
 # ── History Charts ─────────────────────────────────────────────────────────────
-with st.expander("📊 Monitoring History", expanded=False):
+with st.expander("Monitoring History", expanded=False):
     chart_col1, chart_col2 = st.columns(2)
     with chart_col1:
         blockage_chart_ph = st.empty()
@@ -939,7 +1225,7 @@ with st.expander("📊 Monitoring History", expanded=False):
         risk_chart_ph = st.empty()
 
 # ── Data Log Table ─────────────────────────────────────────────────────────────
-with st.expander("🗄 Data Log (Recent 100 entries)", expanded=False):
+with st.expander("Data Log (Recent 100 entries)", expanded=False):
     log_ph = st.empty()
 
 # ── ROI Polygon Draw Mode — overlays on the webcam feed when active ────────────
@@ -957,7 +1243,8 @@ if st.session_state.get("draw_mode", False):
             _bg = cv2.cvtColor(_wf, cv2.COLOR_RGB2BGR)
         elif st.session_state.cam_source != "demo":
             try:
-                _cap_tmp = cv2.VideoCapture(int(st.session_state.cam_source))
+                _src = st.session_state.cam_source
+                _cap_tmp = cv2.VideoCapture(_src if isinstance(_src, str) else int(_src))
                 _cap_tmp.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 _ret, _raw = _cap_tmp.read()
                 _cap_tmp.release()
@@ -980,7 +1267,7 @@ if st.session_state.get("draw_mode", False):
         if _draw_target == "gauge":
             st.markdown(
                 '<div style="font-size:12px;color:#00d4ff;padding:6px 0 8px;">'
-                '💧 <b>Gauge ROI Draw Mode</b> — left-click to add points · right-click to undo · '
+                '<b>Gauge ROI Draw Mode</b> — left-click to add points · right-click to undo · '
                 'R to reset · Draw a polygon around the <b>flood gauge / ruler</b> · '
                 'Click <b>Apply Gauge ROI</b> when done</div>',
                 unsafe_allow_html=True,
@@ -988,7 +1275,7 @@ if st.session_state.get("draw_mode", False):
         else:
             st.markdown(
                 '<div style="font-size:12px;color:#f39c12;padding:6px 0 8px;">'
-                '✏ <b>Draw Mode</b> — left-click to add points · right-click to undo · '
+                '<b>Draw Mode</b> — left-click to add points · right-click to undo · '
                 'R to reset · Click <b>Apply</b> when done</div>',
                 unsafe_allow_html=True,
             )
@@ -1000,6 +1287,17 @@ if st.session_state.get("draw_mode", False):
         except (TypeError, ValueError):
             _cam_idx = 0
 
+        # Video draw mode: base64-encode the chosen MP4 as a data URI
+        _video_src_uri = None
+        _roi_video_path = st.session_state.get('roi_draw_video_path') or st.session_state.get('wl_gauge_draw_video_path')
+        if _roi_video_path and _os.path.isfile(_roi_video_path):
+            try:
+                with open(_roi_video_path, 'rb') as _vf:
+                    _vid_b64 = base64.b64encode(_vf.read()).decode()
+                _video_src_uri = f'data:video/mp4;base64,{_vid_b64}'
+            except Exception as _ve:
+                st.warning(f'Could not load video for ROI drawing: {_ve}')
+
         import streamlit.components.v1 as _components
         _component_html = render_polygon_editor_html(
             bg_b64=bg_b64, bg_w=bg_w, bg_h=bg_h,
@@ -1007,6 +1305,7 @@ if st.session_state.get("draw_mode", False):
             cam_index=_cam_idx,
             draw_target=_draw_target,
             show_save_btn=(_draw_target != "gauge"),
+            video_src=_video_src_uri,
         )
         _components.html(_component_html, height=bg_h + 200, scrolling=False)
 
@@ -1042,16 +1341,18 @@ if st.session_state.get("draw_mode", False):
                     wl_monitor.set_gauge_roi(_pts)
                     worker_state["wl_gauge_roi"] = _pts
                     st.session_state.draw_mode   = False
+                    st.session_state.wl_gauge_draw_video_path = None
                     st.session_state.roi_editor_result = "[]"
                     st.success(
-                        f"✅ Gauge ROI applied — {len(_pts)} points. "
+                        f"Gauge ROI applied — {len(_pts)} points. "
                         "Water level detector is now restricted to this area."
                     )
                 else:
                     roi.set_polygon(_pts)
-                    st.session_state.draw_mode   = False
-                    st.session_state.roi_editor_result = "[]"
-                    st.success(f"✅ Polygon ROI applied — {len(_pts)} points active.")
+                    st.session_state.draw_mode           = False
+                    st.session_state.roi_editor_result   = "[]"
+                    st.session_state.roi_draw_video_path = None
+                    st.success(f"Polygon ROI applied — {len(_pts)} points active.")
                 st.rerun()
             else:
                 st.warning("Need at least 3 points to define the ROI area.")
@@ -1067,9 +1368,10 @@ if st.session_state.get("draw_mode", False):
                     import os as _os
                     _cfg_path = _os.path.join(_os.path.dirname(__file__), "config.py")
                 if save_polygon_to_config(_pts, _cfg_path):
-                    st.session_state.draw_mode   = False
-                    st.session_state.roi_editor_result = "[]"
-                    st.success(f"💾 Saved & applied {len(_pts)}-point polygon to config.")
+                    st.session_state.draw_mode           = False
+                    st.session_state.roi_editor_result   = "[]"
+                    st.session_state.roi_draw_video_path = None
+                    st.success(f"Saved & applied {len(_pts)}-point polygon to config.")
                 else:
                     st.error("Could not write to config.py — check file permissions.")
                 st.rerun()
@@ -1077,8 +1379,10 @@ if st.session_state.get("draw_mode", False):
                 st.warning("Need at least 3 points.")
 
         elif _action == "cancel":
-            st.session_state.draw_mode   = False
-            st.session_state.roi_editor_result = "[]"
+            st.session_state.draw_mode           = False
+            st.session_state.roi_editor_result   = "[]"
+            st.session_state.roi_draw_video_path = None
+            st.session_state.wl_gauge_draw_video_path = None
             st.rerun()
 
 
@@ -1119,35 +1423,52 @@ def camera_worker(state: dict):
         "risk_score": 0.05, "color": "#2ecc71",
     }
     last_new_alerts   = []
+    last_cv_result    = None
+    last_cv_result    = None
+
+    # Determine if cam_src is a video file path or a webcam index
+    _is_video_file = isinstance(cam_src, str) and cam_src not in ("demo",)
 
     if not use_demo:
-        # ── Use DSHOW backend on Windows to avoid MSMF grab errors ───────────
-        # MSMF (Media Foundation) has a known bug where it drops frames and
-        # logs "can't grab frame. Error: -2147483638". DSHOW is more stable.
-        import platform
-        if platform.system() == "Windows":
-            cap_local = cv2.VideoCapture(int(cam_src), cv2.CAP_DSHOW)
+        if _is_video_file:
+            # ── MP4 / video file source ────────────────────────────────────────
+            cap_local = cv2.VideoCapture(cam_src)
+            # For video files, get native FPS for correct playback timing
+            _vid_fps = cap_local.get(cv2.CAP_PROP_FPS) or 25.0
         else:
-            cap_local = cv2.VideoCapture(int(cam_src))
+            # ── Live webcam source ─────────────────────────────────────────────
+            # Use DSHOW backend on Windows to avoid MSMF grab errors.
+            # MSMF (Media Foundation) has a known bug where it drops frames and
+            # logs "can't grab frame. Error: -2147483638". DSHOW is more stable.
+            import platform
+            if platform.system() == "Windows":
+                cap_local = cv2.VideoCapture(int(cam_src), cv2.CAP_DSHOW)
+            else:
+                cap_local = cv2.VideoCapture(int(cam_src))
 
-        # ── Explicit camera hints for maximum FPS ──────────────────────────────
-        cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)       # don't queue stale frames
-        cap_local.set(cv2.CAP_PROP_FPS, 30)             # request 30 FPS from driver
-        cap_local.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap_local.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap_local.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # MJPG >> YUY2 speed
+            # ── Explicit camera hints for maximum FPS ──────────────────────────
+            cap_local.set(cv2.CAP_PROP_BUFFERSIZE, 1)       # keep buffer minimal to avoid stale-frame lag
+            cap_local.set(cv2.CAP_PROP_FPS, 30)             # request 30 FPS from driver
+            cap_local.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+            cap_local.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap_local.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # MJPG >> YUY2 speed
 
         if not cap_local.isOpened():
             print("[Worker] Camera not available — switching to demo mode.")
             use_demo = True
         else:
-            # Warm up: discard first few frames (MSMF/DSHOW often sends blank frames)
-            for _ in range(3):
-                cap_local.read()
+            # Warm up: discard first few frames (MSMF/DSHOW often sends blank frames).
+            # Skip warm-up for video files — we don't want to throw away real frames.
+            if not _is_video_file:
+                for _ in range(2):
+                    cap_local.read()
             _ret, _probe = cap_local.read()
             if _ret and _probe is not None:
                 _probe_r = resize_frame(_probe, width=960)
                 demo_h, demo_w = _probe_r.shape[:2]
+            # For video files, rewind after the probe read so we start from frame 0
+            if _is_video_file:
+                cap_local.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     # Pre-build rain drop position arrays once per intensity change
     _last_rain_intensity = -1.0
@@ -1156,10 +1477,28 @@ def camera_worker(state: dict):
     # Periodic tracker reset — every ~10 min at 25 FPS (15 000 frames)
     TRACKER_RESET_INTERVAL = 15_000
 
+    # ── Frame-rate throttle ───────────────────────────────────────────────────
+    # For video files: pace to native FPS so the video plays at correct speed
+    #   and YOLO isn't hammered by frames decoded faster than real-time.
+    # For webcams: cap at 30 FPS to avoid busy-spinning and reduce CPU load.
+    if _is_video_file:
+        _target_fps  = min(_vid_fps if not use_demo else 30.0, 60.0)  # support up to 60 FPS for video files
+    else:
+        _target_fps  = 30.0
+    _frame_interval  = 1.0 / max(_target_fps, 1.0)   # seconds per frame
+    _next_frame_time = time.time()
+
     try:
         while state["running"]:
             tick += 1
             fps_count += 1
+
+            # ── FPS throttle — sleep until it's time for the next frame ────────
+            _now = time.time()
+            _sleep = _next_frame_time - _now
+            if _sleep > 0:
+                time.sleep(_sleep)
+            _next_frame_time = max(_next_frame_time + _frame_interval, time.time())
 
             # ── Periodic tracker reset (memory hygiene)
             if tick % TRACKER_RESET_INTERVAL == 0:
@@ -1171,12 +1510,20 @@ def camera_worker(state: dict):
             else:
                 ret, raw_frame = cap_local.read()
                 if not ret:
-                    # Transient grab failure (common with MSMF/DSHOW on Windows).
-                    # Retry once immediately before sleeping — usually recovers.
-                    ret, raw_frame = cap_local.read()
-                    if not ret:
-                        time.sleep(0.01)
-                        continue
+                    if _is_video_file:
+                        # End of video file — loop back to the beginning for demo.
+                        cap_local.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, raw_frame = cap_local.read()
+                        if not ret:
+                            time.sleep(0.01)
+                            continue
+                    else:
+                        # Transient grab failure (common with MSMF/DSHOW on Windows).
+                        # Retry once immediately before sleeping — usually recovers.
+                        ret, raw_frame = cap_local.read()
+                        if not ret:
+                            time.sleep(0.01)
+                            continue
                 frame = resize_frame(raw_frame, width=960)
                 demo_h, demo_w = frame.shape[:2]
 
@@ -1243,6 +1590,23 @@ def camera_worker(state: dict):
                     risk_engine=risk_engine,
                 )
 
+                if state.get("cv_rain_enabled", True):
+                    try:
+                        _water_poly = roi.get_polygon() if len(roi.get_polygon()) >= 3 else None
+                        _api_mm_h   = float(weather_svc.get_current().get("rain_mm", 0.0))
+                        _cv_result = rain_validator.analyse(
+                            frame           = frame,
+                            water_polygon   = _water_poly,
+                            api_rain_mm_h   = _api_mm_h,
+                            blockage_pct    = blockage_pct,
+                            predictor_score = flood_result.get("risk_score", 0.0),
+                            run_streaks     = (tick // DETECT_EVERY) % 2 == 0,
+                        )
+                    except Exception:
+                        _cv_result = None
+                else:
+                    _cv_result = None
+
                 custom_th = {
                     "blockage_warning":  state["blockage_warn_th"],
                     "roi_count_warning": state["roi_warn_th"],
@@ -1278,6 +1642,7 @@ def camera_worker(state: dict):
                 last_total_roi    = total_roi
                 last_flood_result = flood_result
                 last_new_alerts   = new_alerts
+                last_cv_result    = _cv_result
             else:
                 # Reuse cached values — just update tracker with empty (keeps IDs alive)
                 tracked       = tracker.update([])
@@ -1289,6 +1654,7 @@ def camera_worker(state: dict):
                 flood_result  = last_flood_result
                 new_alerts    = []
                 wl_result     = wl_monitor.last_result if state.get("wl_enabled", True) else None
+                _cv_result    = last_cv_result
 
             # ── Draw on frame ─────────────────────────────────────────────────
             display_frame = roi.draw_on_frame(
@@ -1301,8 +1667,27 @@ def camera_worker(state: dict):
             if state.get("wl_enabled", True) and wl_result:
                 display_frame = wl_monitor.draw(display_frame, wl_result)
 
+            # ── Camera Rain Validation overlay ────────────────────────────────
+            if state.get("cv_rain_enabled", True) and _cv_result is not None:
+                cv_points = _cv_result.get("cv_points", 0)
+                if cv_points > 0:
+                    badge_text = f"Rain Detected (+{cv_points})"
+                    text_scale = 0.7
+                    text_thickness = 2
+                    txt_size, _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_thickness)
+                    x1, y1 = 12, 12
+                    x2, y2 = x1 + txt_size[0] + 18, y1 + txt_size[1] + 16
+                    overlay = display_frame.copy()
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (8, 35, 70), -1)
+                    cv2.addWeighted(overlay, 0.55, display_frame, 0.45, 0, display_frame)
+                    cv2.putText(display_frame, badge_text,
+                                (x1 + 8, y1 + txt_size[1] + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, text_scale,
+                                (210, 240, 255), text_thickness, cv2.LINE_AA)
+
             # ── Rain overlay — pure numpy, no Python loop ─────────────────────
-            if rain_on and rain_intensity > 0:
+            # Skip rain overlay for MP4 files to reduce CPU load during playback
+            if rain_on and rain_intensity > 0 and not _is_video_file:
                 # Rebuild base drop positions only when frame size or intensity changes
                 if rain_intensity != _last_rain_intensity or _rain_xs is None:
                     n_drops = max(1, int(rain_intensity * 500))
@@ -1349,11 +1734,23 @@ def camera_worker(state: dict):
             )
             if alert_mgr.has_critical():
                 cv2.rectangle(display_frame, (0, 0), (w, 36), (0, 0, 200), -1)
-                cv2.putText(display_frame, "⚠ CRITICAL ALERT — CHECK ALERT CENTER",
+                cv2.putText(display_frame, "CRITICAL ALERT — CHECK ALERT CENTER",
                             (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # BGR → RGB for Streamlit
-            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            # Encode to JPEG bytes in the worker thread so the UI just decodes,
+            # avoiding Streamlit's expensive PNG re-encode on every frame.
+            _encode_w = 854   # encode at ~854px wide (browser upscales) — saves ~35% bandwidth
+            _enc_frame = display_frame
+            if display_frame.shape[1] > _encode_w:
+                _scale = _encode_w / display_frame.shape[1]
+                _enc_frame = cv2.resize(display_frame, (
+                    int(display_frame.shape[1] * _scale),
+                    int(display_frame.shape[0] * _scale),
+                ), interpolation=cv2.INTER_LINEAR)
+            _ok, _jpg = cv2.imencode(".jpg", _enc_frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            frame_jpeg = bytes(_jpg) if _ok else None
+            # Keep RGB copy only if JPEG encode failed (fallback)
+            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB) if not _ok else None
 
             # ── FPS ───────────────────────────────────────────────────────────
             elapsed = time.time() - t_fps
@@ -1392,11 +1789,8 @@ def camera_worker(state: dict):
 
                 log_monitoring_data({
                     "timestamp":            get_timestamp(),
-                    "bottles":              roi_counts.get("bottle", 0),
-                    "plastic_waste":        roi_counts.get("plastic_waste", 0),
-                    "logs_count":           roi_counts.get("log", 0),
-                    "branches":             roi_counts.get("branch", 0),
-                    "trash":                roi_counts.get("trash", 0),
+                    # Dynamic per-class counts — all classes from best.pt are included
+                    "roi_counts":           roi_counts,
                     "total_roi_objects":    total_roi,
                     "blockage_percentage":  blockage_pct,
                     "rain_intensity":       rain_category,
@@ -1422,7 +1816,8 @@ def camera_worker(state: dict):
             # ── Write results under lock ──────────────────────────────────────
             history_max = 60
             with state["lock"]:
-                state["frame_rgb"]        = frame_rgb
+                state["frame_jpeg"]       = frame_jpeg
+                state["frame_rgb"]        = frame_rgb  # fallback only
                 state["fps"]              = round(fps, 1)
                 state["frame_count"]      = tick
                 state["blockage_pct"]     = blockage_pct
@@ -1433,6 +1828,7 @@ def camera_worker(state: dict):
                 state["total_detections"] += len(last_detections)
                 state["history_blockage"] = (state["history_blockage"] + [blockage_pct])[-history_max:]
                 state["history_risk"]     = (state["history_risk"] + [flood_result["risk_score"] * 100])[-history_max:]
+                state["cv_rain_result"]   = _cv_result
                 # Water level
                 if wl_result:
                     state["wl_level_cm"]    = wl_result.get("level_cm")
@@ -1478,16 +1874,18 @@ if st.session_state.monitoring:
     # ── Lightweight Streamlit render loop ─────────────────────────────────────
     # This loop ONLY reads pre-computed results and renders them.
     # All heavy work (detection, tracking, prediction) happens in the thread.
-    RENDER_INTERVAL = 0.04   # ~25 UI refreshes per second
+    RENDER_INTERVAL = 0.033  # ~30 UI refreshes per second
     METRICS_EVERY   = 5      # Update metrics panel every N render ticks
     render_tick     = 0
+    _last_frame_jpeg = None  # track last rendered frame to skip duplicate renders
 
     while st.session_state.monitoring and worker_state["running"]:
         render_tick += 1
 
-        # Snapshot shared state atomically
+        # Snapshot shared state atomically — grab only what's needed this tick
         with worker_state["lock"]:
-            frame_rgb       = worker_state["frame_rgb"]
+            frame_jpeg      = worker_state.get("frame_jpeg")
+            frame_rgb       = worker_state.get("frame_rgb")   # fallback
             fps             = worker_state["fps"]
             frame_count     = worker_state["frame_count"]
             blockage_pct    = worker_state["blockage_pct"]
@@ -1495,48 +1893,63 @@ if st.session_state.monitoring:
             total_roi       = worker_state["total_roi"]
             flood_result    = worker_state["flood_result"]
             alert_list      = worker_state["alert_list"]
-            hist_blockage   = list(worker_state["history_blockage"])
-            hist_risk       = list(worker_state["history_risk"])
-            wl_level_cm     = worker_state.get("wl_level_cm")
-            wl_rise_rate    = worker_state.get("wl_rise_rate", 0.0)
-            wl_trend        = worker_state.get("wl_trend", "Stable")
-            wl_risk_status  = worker_state.get("wl_risk_status", "Normal")
-            wl_history      = list(worker_state.get("wl_history", []))
+            cv_rain_result  = worker_state.get("cv_rain_result")
+            # Only read history when we actually need to update charts
+            if render_tick % 25 == 1:
+                hist_blockage  = list(worker_state["history_blockage"])
+                hist_risk      = list(worker_state["history_risk"])
+            # Only read wl when updating metrics
+            if render_tick % METRICS_EVERY == 1:
+                wl_level_cm    = worker_state.get("wl_level_cm")
+                wl_rise_rate   = worker_state.get("wl_rise_rate", 0.0)
+                wl_trend       = worker_state.get("wl_trend", "Stable")
+                wl_risk_status = worker_state.get("wl_risk_status", "Normal")
+                wl_history     = list(worker_state.get("wl_history", []))
 
-        # Update session state for idle display after stop
-        st.session_state.frame_count      = frame_count
-        st.session_state.blockage_pct     = blockage_pct
-        st.session_state.roi_counts       = roi_counts
-        st.session_state.flood_result     = flood_result
-        st.session_state.alert_list       = alert_list
-        st.session_state.history_blockage = hist_blockage
-        st.session_state.history_risk     = hist_risk
-        st.session_state["wl_level_cm"]   = wl_level_cm
-        st.session_state["wl_rise_rate"]  = wl_rise_rate
-        st.session_state["wl_trend"]      = wl_trend
-        st.session_state["wl_risk_status"]= wl_risk_status
-        st.session_state["wl_history"]    = wl_history
-
-        # ── Render frame ──────────────────────────────────────────────────────
-        if frame_rgb is not None:
-            frame_placeholder.image(frame_rgb, width="stretch")
+        # ── Render frame — use pre-encoded JPEG for zero re-encode cost ───────
+        if frame_jpeg is not None and frame_jpeg is not _last_frame_jpeg:
+            _last_frame_jpeg = frame_jpeg
+            _b64 = base64.b64encode(frame_jpeg).decode()
+            frame_placeholder.markdown(
+                f'<img src="data:image/jpeg;base64,{_b64}" '
+                f'style="width:100%;height:auto;display:block;border-radius:6px;">',
+                unsafe_allow_html=True,
+            )
+        elif frame_rgb is not None and frame_jpeg is None:
+            # Fallback: JPEG encode failed, use numpy array
+            frame_placeholder.image(frame_rgb, use_container_width=True)
 
         fps_placeholder.markdown(
             f'<div style="font-size:11px;color:#4a6b8a;text-align:right;">'
-            f'⚡ {fps:.1f} FPS · Frame #{frame_count:,}</div>',
+            f'{fps:.1f} FPS · Frame #{frame_count:,}</div>',
             unsafe_allow_html=True,
         )
+
+        # Update session state for idle display after stop (only on metrics ticks)
+        if render_tick % METRICS_EVERY == 1:
+            st.session_state.frame_count       = frame_count
+            st.session_state.blockage_pct      = blockage_pct
+            st.session_state.roi_counts        = roi_counts
+            st.session_state.flood_result      = flood_result
+            st.session_state.alert_list        = alert_list
+            st.session_state["wl_level_cm"]    = wl_level_cm
+            st.session_state["wl_rise_rate"]   = wl_rise_rate
+            st.session_state["wl_trend"]       = wl_trend
+            st.session_state["wl_risk_status"] = wl_risk_status
+            st.session_state["cv_rain_result"] = cv_rain_result
 
         # ── Metric panels (throttled — no need to redraw every render tick) ──
         if render_tick % METRICS_EVERY == 1:
             with metric_ph_blockage:
                 render_blockage_bar(blockage_pct)
             with metric_ph_rain:
+                _is_day = True
                 if st.session_state.use_live_weather:
                     try:
                         _wx = weather_svc.get_current()
                         _live_rain_category = _wx.get("condition_label",
                                                        rain_intensity_to_category(st.session_state.rain_intensity))
+                        _is_day = _wx.get("is_day", True)
                     except Exception:
                         _live_rain_category = rain_intensity_to_category(st.session_state.rain_intensity)
                 else:
@@ -1546,6 +1959,7 @@ if st.session_state.monitoring:
                     st.session_state.rain_intensity,
                     rain_category=_live_rain_category,
                     use_live_weather=st.session_state.use_live_weather,
+                    is_day=_is_day,
                 )
             with metric_ph_risk:
                 risk_lbl   = flood_result["risk"].split()[0]
@@ -1555,6 +1969,15 @@ if st.session_state.monitoring:
                     f"{flood_result['risk_score']*100:.0f}",
                     "/100", risk_color,
                 )
+            with metric_ph_cv:
+                cv_rain_result = worker_state.get("cv_rain_result")
+                if cv_rain_result is not None and st.session_state.get("cv_rain_enabled", True):
+                    st.markdown(
+                        render_cv_validation_panel(cv_rain_result),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    metric_ph_cv.empty()
             with roi_count_ph:
                 render_roi_counts(roi_counts)
             with risk_ph:
@@ -1627,11 +2050,13 @@ else:
     with metric_ph_blockage:
         render_blockage_bar(st.session_state.blockage_pct)
     with metric_ph_rain:
+        _is_day = True
         if st.session_state.use_live_weather:
             try:
                 _wx = weather_svc.get_current()
                 _live_rain_category = _wx.get("condition_label",
                                                rain_intensity_to_category(st.session_state.rain_intensity))
+                _is_day = _wx.get("is_day", True)
             except Exception:
                 _live_rain_category = rain_intensity_to_category(st.session_state.rain_intensity)
         else:
@@ -1641,6 +2066,7 @@ else:
             st.session_state.rain_intensity,
             rain_category=_live_rain_category,
             use_live_weather=st.session_state.use_live_weather,
+            is_day=_is_day,
         )
     with metric_ph_risk:
         # Show weather-driven risk score even when idle — same .metric-card box as START state
@@ -1706,14 +2132,14 @@ else:
             st.info("No monitoring data yet. Click ▶ START to begin.")
 
     # Idle hint
-    st.markdown("""
+    st.markdown(f"""
 <div style="text-align:center;padding:30px 0;color:var(--text-muted);">
-    <div style="font-size:40px;margin-bottom:12px;">🌊</div>
+    <div style="margin-bottom:12px;">{icon_html("waves", size=40, color="var(--accent-cyan)")}</div>
     <div style="font-size:16px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;">
         System Ready
     </div>
     <div style="font-size:13px;">
-        Select a camera source and click <strong>▶ START</strong> to begin monitoring
+        Select a camera source and click <strong>START</strong> to begin monitoring
     </div>
 </div>
 """, unsafe_allow_html=True)

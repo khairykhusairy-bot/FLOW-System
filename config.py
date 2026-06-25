@@ -17,7 +17,7 @@ WEBCAM_INDEX = 0                           # Camera index for setup_polygon.py a
 # ─── Polygon ROI ───────────────────────────────────────────────────────────────
 # Set by setup_polygon.py — do not edit this line manually unless you know the coords.
 # Format: list of (x, y) integer tuples. Needs >= 3 points.
-ROI_POLYGON  = [(94, 334), (10, 534), (950, 533), (950, 338)]
+ROI_POLYGON  = [(19, 13), (22, 532), (952, 530), (951, 19)]
 
 # ─── Detection Defaults ────────────────────────────────────────────────────────
 DEFAULT_CONFIDENCE  = 0.35
@@ -56,9 +56,16 @@ WEATHER_LOCATIONS = {
     "Kota Kinabalu, Sabah":        (5.9804,  116.0735),
 }
 
-# ─── Google Maps Platform Weather API ────────────────────────────────────────
-# Replaces the old OpenWeatherMap key.  Used by weather.py.
+# ─── Weather API Keys ────────────────────────────────────────────────────────
+# Google Maps Platform Weather API
 GOOGLE_WEATHER_API_KEY = "AIzaSyAlrDArY-Dy7Kh-HIf-_jnPcctACqsvIxE"
 
-# Legacy alias kept so any other module that still imports OWM_API_KEY won't crash.
-OWM_API_KEY = GOOGLE_WEATHER_API_KEY
+# OpenWeatherMap API (3-hour forecast intervals)
+OWM_API_KEY = "a7bef62f4dc463f7af92b1256165e1c8"
+
+# Default weather provider: "google" or "openweathermap"
+WEATHER_PROVIDER = "google"
+
+# ─── Timezone Configuration ────────────────────────────────────────────────────
+# Timezone offset in hours for forecast display (Malaysia Time = UTC+8)
+TIMEZONE_OFFSET_HOURS = 8

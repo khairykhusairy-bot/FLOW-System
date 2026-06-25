@@ -6,21 +6,44 @@ Utilities Module: Helper functions and constants
 import cv2
 import numpy as np
 from datetime import datetime, timezone, timedelta
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 
 # Malaysia timezone (UTC+8)
 MYT = timezone(timedelta(hours=8))
 
 
-# ─── YOLO Class Labels ────────────────────────────────────────────────────────
-DEBRIS_CLASSES = {
-    0: "bottle",
-    1: "plastic_waste",
-    2: "log",
-    3: "branch",
-    4: "trash",
-    5: "river_debris",
-}
+# ─── Dynamic YOLO Class Loader ────────────────────────────────────────────────
+def load_model_classes(model_path: str = "best.pt") -> Dict[int, str]:
+    """
+    Read class names directly from a YOLO .pt model file.
+    Returns a dict of {class_id: class_name} from the model.
+    Falls back to an empty dict if the model cannot be loaded.
+    This means adding new classes to best.pt automatically reflects
+    everywhere in FLOW without any code changes.
+    """
+    import os
+    if not os.path.exists(model_path):
+        return {}
+    try:
+        from ultralytics import YOLO
+        model = YOLO(model_path)
+        if hasattr(model, "names") and model.names:
+            return dict(model.names)
+    except Exception as e:
+        print(f"[FLOW] load_model_classes: could not read {model_path}: {e}")
+    return {}
+
+
+def get_model_class_names(model_path: str = "best.pt") -> List[str]:
+    """Return a sorted list of class name strings from best.pt."""
+    classes = load_model_classes(model_path)
+    return [classes[i] for i in sorted(classes.keys())]
+
+
+# ─── YOLO Class Labels (dynamically populated from best.pt) ──────────────────
+# This dict is populated at import time. Any new class added to best.pt is
+# automatically included — no manual edits required.
+DEBRIS_CLASSES: Dict[int, str] = load_model_classes("best.pt")
 
 # Fallback COCO labels for when using standard YOLO weights
 COCO_DEBRIS_MAP = {

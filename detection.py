@@ -18,6 +18,8 @@ except ImportError:
 from utils import COCO_DEBRIS_MAP
 
 # ─── Debris label sets ─────────────────────────────────────────────────────────
+# NOTE: DEBRIS_KEYWORDS is only used for the COCO fallback model path.
+# When using best.pt (custom model), all classes from the model are used directly.
 DEBRIS_KEYWORDS = {
     "bottle", "plastic_waste", "log", "branch", "trash",
     "river_debris", "cup", "bag", "can", "wrapper"
@@ -28,6 +30,10 @@ class DebrisDetector:
     """
     Loads a YOLO model (best.pt or fallback to yolov8n) and runs inference
     on frames to detect river debris objects.
+
+    Class names are read directly from whichever model is loaded.
+    Adding new classes to best.pt is automatically reflected throughout
+    FLOW with no further code changes required.
     """
 
     def __init__(self, model_path: str = "best.pt", confidence: float = 0.35):
@@ -74,25 +80,39 @@ class DebrisDetector:
     def _init_class_names(self):
         """Extract class names from the loaded model."""
         if self.model and hasattr(self.model, "names"):
-            self.class_names = self.model.names
+            self.class_names = dict(self.model.names)
         else:
             self.class_names = {i: f"class_{i}" for i in range(80)}
 
+    def get_class_names(self) -> List[str]:
+        """
+        Return all class name strings known by the currently loaded model.
+        This is the single source of truth for what FLOW can detect and log.
+        """
+        if self.using_demo_mode:
+            return ["bottle", "plastic_waste", "log", "branch", "trash", "river_debris"]
+        return [self.class_names[i] for i in sorted(self.class_names.keys())]
+
     def _map_label(self, raw_label: str) -> str:
-        """Map COCO or custom labels to FLOW debris categories."""
+        """
+        Map a raw model label to its display name.
+
+        - Custom model (best.pt): return the label exactly as the model defines it.
+          No remapping — whatever class is in best.pt is what FLOW displays.
+        - COCO fallback model: map standard COCO names to debris categories.
+        """
+        if self.model_type == "custom":
+            # Pass through directly — trust the custom model's own class names
+            return raw_label
+
+        # COCO fallback path: try to map to known debris category
         label_lower = raw_label.lower().replace(" ", "_")
-        # Direct match
-        if label_lower in DEBRIS_KEYWORDS:
-            return label_lower
-        # COCO mapping
         mapped = COCO_DEBRIS_MAP.get(raw_label.lower(), None)
         if mapped:
             return mapped
-        # Keyword heuristic
         for kw in DEBRIS_KEYWORDS:
             if kw in label_lower:
                 return kw
-        # Return all objects in demo/fallback mode to show activity
         return label_lower
 
     def detect(self, frame: np.ndarray) -> List[Dict]:
@@ -136,8 +156,8 @@ class DebrisDetector:
                     raw_label = self.class_names.get(cls_id, f"class_{cls_id}")
                     label = self._map_label(raw_label)
 
-                    # In custom model mode, keep all detections
-                    # In COCO mode, filter to debris-like objects only
+                    # Custom model: keep all detections (all classes are valid debris)
+                    # COCO model: filter to only debris-mapped objects
                     if self.model_type == "coco":
                         if raw_label.lower() not in COCO_DEBRIS_MAP:
                             continue
@@ -156,7 +176,8 @@ class DebrisDetector:
     def _generate_demo_detections(self, frame: np.ndarray) -> List[Dict]:
         """
         Generate realistic simulated detections for demo / no-model mode.
-        Detections move and vary over time to simulate a live river feed.
+        Uses whatever class names are defined in best.pt when available,
+        otherwise uses a built-in fallback list.
         """
         h, w = frame.shape[:2]
         self._demo_tick += 1
@@ -164,15 +185,19 @@ class DebrisDetector:
 
         np.random.seed(t // 8)  # Change every ~8 frames for smooth motion
 
-        debris_classes = [
-            "bottle", "plastic_waste", "log",
-            "branch", "trash", "river_debris"
-        ]
+        # Use real model class names if loaded, otherwise a safe fallback list
+        if self.class_names:
+            demo_classes = list(self.class_names.values())
+        else:
+            demo_classes = [
+                "bottle", "plastic_waste", "log",
+                "branch", "trash", "river_debris"
+            ]
+
         detections = []
         n = np.random.randint(3, 10)
 
         for i in range(n):
-            # Oscillate positions with time
             base_x = int((w * (i + 1)) / (n + 1))
             base_y = int(h * 0.35 + h * 0.3 * np.random.rand())
             dx = int(30 * np.sin(t * 0.05 + i * 1.2))
@@ -183,7 +208,7 @@ class DebrisDetector:
             x2 = min(w - 1, x1 + np.random.randint(40, 100))
             y2 = min(h - 1, y1 + np.random.randint(30, 70))
 
-            label = debris_classes[i % len(debris_classes)]
+            label = demo_classes[i % len(demo_classes)]
             conf = round(0.55 + 0.40 * np.random.rand(), 3)
 
             detections.append({
