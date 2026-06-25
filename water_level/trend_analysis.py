@@ -55,7 +55,7 @@ class WaterLevelTrend:
     def __init__(
         self,
         window_secs: float = TREND_WINDOW_SECS,
-        max_history: int   = 300,
+        max_history: int   = 180,
     ):
         self._window: float = max(5.0, window_secs)
         # Deque stores (timestamp_float, level_cm) tuples
@@ -64,6 +64,13 @@ class WaterLevelTrend:
         self._trend_label: str            = TREND_STABLE
         self._risk_status: str            = STATUS_NORMAL
         self._last_level_cm: Optional[float] = None
+        # Live thresholds (can be updated via set_thresholds())
+        self._thresholds: Dict[str, float] = {
+            "normal": THRESHOLD_NORMAL,
+            "warning": THRESHOLD_WARNING,
+            "danger": THRESHOLD_DANGER,
+            "critical": THRESHOLD_CRITICAL,
+        }
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -125,6 +132,22 @@ class WaterLevelTrend:
         self._risk_status = STATUS_NORMAL
         self._last_level_cm = None
 
+    def set_thresholds(self, thresholds: Dict[str, float]):
+        """Update risk classification thresholds at runtime.
+
+        Parameters
+        ----------
+        thresholds : dict with keys 'normal', 'warning', 'danger', 'critical'
+        """
+        if "normal" in thresholds:
+            self._thresholds["normal"] = thresholds["normal"]
+        if "warning" in thresholds:
+            self._thresholds["warning"] = thresholds["warning"]
+        if "danger" in thresholds:
+            self._thresholds["danger"] = thresholds["danger"]
+        if "critical" in thresholds:
+            self._thresholds["critical"] = thresholds["critical"]
+
     # ── Private Helpers ────────────────────────────────────────────────────────
 
     def _calc_rise_rate(self, now: float) -> float:
@@ -175,14 +198,13 @@ class WaterLevelTrend:
         else:
             return TREND_STABLE
 
-    @staticmethod
-    def _classify_risk(level_cm: float) -> str:
+    def _classify_risk(self, level_cm: float) -> str:
         """Map absolute water level to risk status label."""
-        if level_cm >= THRESHOLD_CRITICAL:
+        if level_cm >= self._thresholds["critical"]:
             return STATUS_CRITICAL
-        elif level_cm >= THRESHOLD_DANGER:
+        elif level_cm >= self._thresholds["danger"]:
             return STATUS_DANGER
-        elif level_cm >= THRESHOLD_WARNING:
+        elif level_cm >= self._thresholds["warning"]:
             return STATUS_WARNING
         else:
             return STATUS_NORMAL

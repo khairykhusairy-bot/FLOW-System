@@ -78,6 +78,8 @@ class WaterLevelMonitor:
             "danger":   _cfg.THRESHOLD_DANGER,
             "critical": _cfg.THRESHOLD_CRITICAL,
         }
+        # Sync thresholds to trend analyzer
+        self.trend.set_thresholds(self.thresholds)
 
         # Alert state (simple cooldown to avoid log floods)
         self._alert_cooldown: Dict[str, float] = {}
@@ -136,25 +138,6 @@ class WaterLevelMonitor:
         else:
             trend_data = self.trend.snapshot()
 
-        # Override risk_status with live thresholds (trend_analysis uses config constants)
-        if smoothed_cm is not None:
-            t_n = self.thresholds.get("normal",   _cfg.THRESHOLD_NORMAL)
-            t_w = self.thresholds.get("warning",  _cfg.THRESHOLD_WARNING)
-            t_d = self.thresholds.get("danger",   _cfg.THRESHOLD_DANGER)
-            t_c = self.thresholds.get("critical", _cfg.THRESHOLD_CRITICAL)
-            from water_level.trend_analysis import (
-                STATUS_NORMAL, STATUS_WARNING, STATUS_DANGER, STATUS_CRITICAL)
-            if smoothed_cm >= t_c:
-                live_risk = STATUS_CRITICAL
-            elif smoothed_cm >= t_d:
-                live_risk = STATUS_DANGER
-            elif smoothed_cm >= t_w:
-                live_risk = STATUS_WARNING
-            else:
-                live_risk = STATUS_NORMAL
-            trend_data = dict(trend_data)
-            trend_data["risk_status"] = live_risk
-
         # ── Normalise for flood predictor ─────────────────────────────────────
         level_norm = 0.5
         if smoothed_cm is not None:
@@ -179,6 +162,14 @@ class WaterLevelMonitor:
             "alerts":           alerts,
             "detection_rate":   round(self.detector.detection_rate, 3),
             "smoother_info":    self.smoother.diagnostics(),
+            "detector_info": {
+                "detection_rate": round(self.detector.detection_rate, 3),
+                "detection_quality": self._compute_detection_quality(y_px),
+            },
+            "trend_info": {
+                "reading_count": self.trend.reading_count,
+                "window_full": self.trend.reading_count >= 60,
+            },
         }
         self._last_result = result
         return result
@@ -209,12 +200,8 @@ class WaterLevelMonitor:
         Update gauge ROI polygon at runtime and re-anchor the calibration
         Y bounds to the polygon's vertical extent.
 
-        After this call:
-          • calibration.y_min_px = topmost Y of the polygon  (→ h_max_cm)
-          • calibration.y_max_px = bottommost Y of the polygon (→ h_min_cm)
-
-        This means 0 cm maps to the bottom of the drawn ROI and the
-        maximum height maps to the top, spanning the full ROI end-to-end.
+        The height bounds (h_min_cm, h_max_cm) are preserved if already calibrated,
+        otherwise they span the full ROI as default.
         """
         self.gauge_roi = polygon
         self.detector.set_gauge_roi(polygon)
@@ -224,13 +211,44 @@ class WaterLevelMonitor:
             roi_y_min = min(ys)   # top of polygon    → high water (h_max_cm)
             roi_y_max = max(ys)   # bottom of polygon → low water  (h_min_cm)
             if roi_y_min < roi_y_max:
-                # Preserve the real-world height range; only re-anchor the pixels.
+                # Store previous bounds to detect if calibration changed
+                prev_y_min = self.calibration.y_min_px
+                prev_y_max = self.calibration.y_max_px
+                prev_h_min = self.calibration.h_min_cm
+                prev_h_max = self.calibration.h_max_cm
+
+                # Update pixel bounds
                 self.calibration.y_min_px = roi_y_min
                 self.calibration.y_max_px = roi_y_max
+
+                # If not yet calibrated or ROI changed significantly,
+                # scale the height bounds proportionally
+                if prev_y_min is None or prev_y_max is None:
+                    # First calibration: use default height span
+                    self.calibration.h_min_cm = 0.0
+                    self.calibration.h_max_cm = 200.0
+                else:
+                    roi_height_prev = prev_y_max - prev_y_min
+                    roi_height_new = roi_y_max - roi_y_min
+                    if roi_height_prev > 0:
+                        # Scale the height bounds proportionally to ROI change
+                        scale_factor = roi_height_new / roi_height_prev
+                        self.calibration.h_min_cm = prev_h_min
+                        self.calibration.h_max_cm = prev_h_max * scale_factor
 
     def set_river_roi(self, polygon: Optional[List[Tuple[int, int]]]):
         """Update river surface ROI polygon (display only)."""
         self.river_roi = polygon
+
+    def set_thresholds(self, thresholds: Dict):
+        """Update alert thresholds and sync to trend analyzer.
+
+        Parameters
+        ----------
+        thresholds : dict with keys 'normal', 'warning', 'danger', 'critical'
+        """
+        self.thresholds.update(thresholds)
+        self.trend.set_thresholds(self.thresholds)
 
     def reset(self):
         """Reset smoother and trend buffers (e.g. after camera switch)."""
@@ -302,6 +320,35 @@ class WaterLevelMonitor:
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
+    def _compute_detection_quality(self, y_px: Optional[int]) -> float:
+        """
+        Estimate detection quality (0-1) based on:
+        - Whether a detection was found
+        - Consistency with previous frames (no wild jumps)
+        - Detection rate
+        """
+        if y_px is None:
+            return 0.0
+
+        # Base quality from detection rate
+        quality = self.detector.detection_rate
+
+        # Penalty if the gauge ROI bounds aren't set
+        if self.gauge_roi is None:
+            quality *= 0.7
+
+        # Check for sanity (waterline in top/bottom 5% is suspicious)
+        if self.detector._gauge_roi is not None:
+            ys = [pt[1] for pt in self.detector._gauge_roi]
+            roi_top = min(ys)
+            roi_bottom = max(ys)
+            roi_height = roi_bottom - roi_top
+            if roi_height > 0:
+                if y_px < roi_top + 0.05 * roi_height or y_px > roi_bottom - 0.05 * roi_height:
+                    quality *= 0.7
+
+        return round(quality, 2)
+
     @staticmethod
     def _empty_result() -> Dict:
         return {
@@ -317,6 +364,8 @@ class WaterLevelMonitor:
             "alerts":            [],
             "detection_rate":    0.0,
             "smoother_info":     {},
+            "detector_info":     {"detection_rate": 0.0, "detection_quality": 0.0},
+            "trend_info":        {"reading_count": 0, "window_full": False},
         }
 
     # ── Properties ─────────────────────────────────────────────────────────────
